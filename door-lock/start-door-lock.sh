@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# X 세션 밖에서 실행된 경우 startx 실행 후 종료
+# (.xinitrc가 DISPLAY 세팅된 채로 이 스크립트를 다시 호출함)
+if [ -z "$DISPLAY" ]; then
+    startx
+    exit
+fi
+
 DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)"
 PWA_URL="https://feat-door-lock.khlug-dev.pages.dev/door-lock"
 BLANK_TIMEOUT=300          # 야간 화면 절전 시간 (초, 21:00~09:00)

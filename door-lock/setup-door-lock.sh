@@ -188,9 +188,8 @@ if ! sudo grep -qF "$BASHRC_MARK" "${KIOSK_HOME}/.bashrc" 2>/dev/null; then
     sudo tee -a "${KIOSK_HOME}/.bashrc" > /dev/null << 'EOF'
 
 # door-lock: auto startx
-if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-    startx
-    sleep infinity
+if [ "$(tty)" = "/dev/tty1" ]; then
+    /home/kiosk/start-door-lock.sh
 fi
 EOF
     echo "  .bashrc에 startx 설정 추가"
