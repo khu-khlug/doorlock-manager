@@ -156,6 +156,8 @@ echo ""
 
 # ── 5. PWA 설치 정책 설정 ─────────────────────────────────────────────────────
 echo "[5/11] PWA 설치 정책 설정 중..."
+sudo rm -rf "${KIOSK_HOME}/.config/chromium"
+echo "  Chromium 프로필 초기화 (PWA 캐시 및 로컬 스토리지 삭제)"
 sudo mkdir -p /etc/chromium/policies/managed
 sudo tee /etc/chromium/policies/managed/pwa_install.json > /dev/null << EOF
 {

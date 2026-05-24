@@ -26,6 +26,10 @@ else
     xset dpms "$BLANK_TIMEOUT" "$BLANK_TIMEOUT" "$BLANK_TIMEOUT"
 fi
 xrandr --output DSI-1 --rotate inverted
+TOUCH_ID=$(xinput list | grep -i "ft5x06" | grep -oP 'id=\K[0-9]+' | head -1)
+if [ -n "$TOUCH_ID" ]; then
+    xinput set-prop "$TOUCH_ID" "Coordinate Transformation Matrix" -1 0 1 0 -1 1 0 0 1
+fi
 unclutter -idle 0 &  # 마우스 커서 끔
 
 # ── 3. Chromium 키오스크 실행 ─────────────────────────────────────────────────
@@ -39,4 +43,5 @@ chromium \
     --disable-translate \
     --noerrdialogs \
     --disable-infobars \
+    --disable-features=PrivateNetworkAccessPermissionPrompt \
     --app="$PWA_URL"
