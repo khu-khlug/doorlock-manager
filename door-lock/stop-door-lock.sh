@@ -40,4 +40,4 @@ stop_process() {
 echo "[stop] 기존 프로세스 종료 중..."
 stop_process "chromium" "Chromium"
 stop_process "unclutter"        "unclutter"
-stop_process "$DAEMON_DIR"      "데몬"
+stop_process "door-lock-daemon.py" "데몬"
