@@ -1,7 +1,7 @@
 #!/bin/bash
 
 DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)"
-PWA_URL="https://3a603f26.khlug-dev.pages.dev/door-lock"
+PWA_URL="https://feat-door-lock.khlug-dev.pages.dev/door-lock"
 BLANK_TIMEOUT=300          # 야간 화면 절전 시간 (초, 21:00~09:00)
 
 # ── 1. 기존 프로세스 종료 ─────────────────────────────────────────────────────
