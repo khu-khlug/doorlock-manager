@@ -135,8 +135,22 @@ sudo chmod +x "${KIOSK_HOME}/.xinitrc"
 sudo chown "${KIOSK_USER}:${DOOR_LOCK_GROUP}" "${KIOSK_HOME}/.bashrc" "${KIOSK_HOME}/.xinitrc"
 echo "  .xinitrc 설정 완료"
 
-# ── 7. GPIO 권한 확인 ─────────────────────────────────────────────────────────
-echo "[7/7] GPIO 권한 확인 중..."
+# ── 7. 디스플레이 절전 cron 등록 ─────────────────────────────────────────────
+echo "[7/8] 디스플레이 절전 cron 등록 중..."
+CRON_MARK="# door-lock: display power"
+if ! sudo crontab -u "$KIOSK_USER" -l 2>/dev/null | grep -qF "$CRON_MARK"; then
+    (sudo crontab -u "$KIOSK_USER" -l 2>/dev/null; \
+     echo "$CRON_MARK"; \
+     echo "0 9  * * * DISPLAY=:0 xset s off; DISPLAY=:0 xset -dpms"; \
+     echo "0 21 * * * DISPLAY=:0 xset s 300 300; DISPLAY=:0 xset dpms 300 300 300") \
+    | sudo crontab -u "$KIOSK_USER" -
+    echo "  cron 등록 완료 (09:00 절전 해제 / 21:00 절전 활성화)"
+else
+    echo "  cron 이미 등록됨, 건너뜀"
+fi
+
+# ── 8. GPIO 권한 확인 ─────────────────────────────────────────────────────────
+echo "[8/8] GPIO 권한 확인 중..."
 if ! groups "$KIOSK_USER" | grep -q '\bgpio\b'; then
     echo "  경고: gpio 그룹이 없습니다. python3-rpi.gpio 또는 python3-gpiozero 설치를 확인하세요." >&2
 else
