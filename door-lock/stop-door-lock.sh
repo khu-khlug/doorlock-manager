@@ -1,6 +1,5 @@
 #!/bin/bash
 
-DAEMON_DIR="${DAEMON_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 
 # ── 프로세스 종료 헬퍼 ────────────────────────────────────────────────────────
 # 용법: stop_process <pgrep 패턴> <표시 이름>
@@ -39,5 +38,4 @@ stop_process() {
 # ── 기존 프로세스 종료 ────────────────────────────────────────────────────────
 echo "[stop] 기존 프로세스 종료 중..."
 stop_process "chromium" "Chromium"
-stop_process "unclutter"        "unclutter"
-stop_process "door-lock-daemon.py" "데몬"
+stop_process "unclutter" "unclutter"
