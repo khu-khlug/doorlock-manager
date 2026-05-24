@@ -25,7 +25,13 @@ sudo apt-get install -y \
     unclutter \
     python3-flask \
     python3-gpiozero \
-    python3-requests
+    python3-requests \
+    fonts-nanum \
+    locales
+
+sudo sed -i 's/^# *ko_KR.UTF-8/ko_KR.UTF-8/' /etc/locale.gen
+sudo locale-gen ko_KR.UTF-8
+sudo update-locale LANG=ko_KR.UTF-8 LC_ALL=ko_KR.UTF-8
 
 # ── 2. 사용자 및 그룹 설정 ────────────────────────────────────────────────────
 echo "[2/10] 사용자 및 그룹 설정 중..."
