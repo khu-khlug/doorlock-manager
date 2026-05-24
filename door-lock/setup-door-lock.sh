@@ -163,6 +163,9 @@ sudo tee /etc/chromium/policies/managed/pwa_install.json > /dev/null << EOF
       "url": "${PWA_URL}",
       "default_launch_container": "window"
     }
+  ],
+  "InsecurePrivateNetworkRequestsAllowedForUrls": [
+    "${PWA_URL}"
   ]
 }
 EOF
