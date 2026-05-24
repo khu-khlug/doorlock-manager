@@ -4,7 +4,7 @@ DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)"
 DAEMON_PORT=8080
 DAEMON_HEALTH="http://localhost:${DAEMON_PORT}/health"
 DAEMON_HEALTH_TIMEOUT=30   # 데몬 준비 대기 최대 시간 (초)
-PWA_URL="https://app.khlug.org/door-lock"
+PWA_URL="https://3a603f26.khlug-dev.pages.dev/door-lock"
 BLANK_TIMEOUT=300          # 화면 절전 시간 (초)
 
 # ── 1. 기존 프로세스 종료 ─────────────────────────────────────────────────────

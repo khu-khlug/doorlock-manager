@@ -4,13 +4,13 @@
 
 set -e
 
-REPO_RAW="https://raw.githubusercontent.com/khu-khlug/sight-infra/main/door-lock"
+REPO_RAW="https://raw.githubusercontent.com/nananina0415/sight-infra/feat/door-lock/door-lock"
 DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)" # 이 파일이 있는 디렉토리
 SETUP_USER="${SUDO_USER:-$(whoami)}"
 KIOSK_USER="kiosk"
 KIOSK_HOME="/home/${KIOSK_USER}"
 DOOR_LOCK_GROUP="door-lock"
-PWA_URL="https://app.khlug.org/door-lock"
+PWA_URL="https://3a603f26.khlug-dev.pages.dev/door-lock"
 
 # ── 1. 시스템 패키지 설치 ─────────────────────────────────────────────────────
 echo "[1/7] 시스템 패키지 설치 중..."
@@ -28,7 +28,7 @@ sudo apt-get install -y \
 echo "[2/7] 스크립트 다운로드 중..."
 mkdir -p "$DAEMON_DIR"
 
-for file in start-door-lock.sh stop-door-lock.sh door-lock-daemon.py; do
+for file in start-door-lock.sh stop-door-lock.sh door-lock-daemon.py README.md; do
     curl -fsSL "${REPO_RAW}/${file}" -o "${DAEMON_DIR}/${file}"
     echo "  다운로드 완료: ${file}"
 done
