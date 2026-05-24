@@ -4,7 +4,7 @@
 
 set -e
 
-REPO_RAW="https://raw.githubusercontent.com/nananina0415/sight-infra/feat/door-lock/door-lock"
+REPO_RAW="https://raw.githubusercontent.com/nananina0415/sight-infra/test/door-lock/door-lock"
 DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)" # 이 파일이 있는 디렉토리
 SETUP_USER="${SUDO_USER:-$(whoami)}"
 KIOSK_USER="kiosk"
