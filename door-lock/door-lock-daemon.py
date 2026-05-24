@@ -21,6 +21,7 @@ def cors(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
     return response
 
 
@@ -42,7 +43,7 @@ def unlock():
     if student_id is None:
         return cors(jsonify({"message": "studentId required"})), 400
 
-    if str(student_id) == "0000000000":
+    if student_id == 0 or str(student_id) == "0000000000":
         time.sleep(3)
         relay.on()
         time.sleep(UNLOCK_DURATION)
