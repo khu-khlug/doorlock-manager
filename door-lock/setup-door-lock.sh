@@ -11,7 +11,7 @@ KIOSK_USER="kiosk"
 KIOSK_HOME="/home/${KIOSK_USER}"
 DOOR_LOCK_GROUP="door-lock"
 DAEMON_SVC_USER="door-lock-svc"
-PWA_URL="https://3a603f26.khlug-dev.pages.dev/door-lock"
+PWA_URL="https://feat-door-lock.khlug-dev.pages.dev/door-lock"
 BACKEND_URL="https://api.dev.khlugy.app"
 
 # ── 1. 시스템 패키지 설치 ─────────────────────────────────────────────────────
