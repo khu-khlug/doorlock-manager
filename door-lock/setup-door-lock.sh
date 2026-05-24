@@ -33,6 +33,20 @@ sudo sed -i 's/^# *ko_KR.UTF-8/ko_KR.UTF-8/' /etc/locale.gen
 sudo locale-gen ko_KR.UTF-8
 sudo update-locale LANG=ko_KR.UTF-8 LC_ALL=ko_KR.UTF-8
 
+sudo tee /etc/fonts/conf.d/99-nanum-default.conf > /dev/null << 'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <alias>
+    <family>sans-serif</family>
+    <prefer>
+      <family>NanumGothic</family>
+    </prefer>
+  </alias>
+</fontconfig>
+EOF
+sudo fc-cache -f
+
 # ── 2. 사용자 및 그룹 설정 ────────────────────────────────────────────────────
 echo "[2/10] 사용자 및 그룹 설정 중..."
 

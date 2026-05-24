@@ -39,7 +39,7 @@ def unlock():
 
     data = request.get_json(silent=True) or {}
     student_id = data.get("studentId")
-    if not student_id:
+    if student_id is None:
         return cors(jsonify({"message": "studentId required"})), 400
 
     if str(student_id) == "0000000000":
