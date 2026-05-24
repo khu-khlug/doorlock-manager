@@ -170,6 +170,10 @@ sudo tee /etc/chromium/policies/managed/pwa_install.json > /dev/null << EOF
   "InsecurePrivateNetworkRequestsAllowedForUrls": [
     "${PWA_ORIGIN}"
   ],
+  "LocalNetworkAccessAllowedForUrls": [
+    "${PWA_ORIGIN}"
+  ],
+  "PrivateNetworkAccessRestrictionsEnabled": false,
   "DeveloperToolsAvailability": 2,
   "TranslateEnabled": false
 }
