@@ -1,11 +1,10 @@
 #!/bin/bash
 # 초기 가정: Raspberry Pi Imager로 Raspbian 64-bit Lite 설치 직후 상태
-# 실행 방법: 네 파일을 한 폴더에 내려받은 후 이 스크립트를 실행
+# 실행 방법: 이 스크립트를 내려받아 실행하면 나머지 파일을 자동으로 설치
 
 set -e
 
 REPO_RAW="https://raw.githubusercontent.com/nananina0415/sight-infra/test/door-lock/door-lock"
-DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)" # 이 파일이 있는 디렉토리
 SETUP_USER="${SUDO_USER:-$(whoami)}"
 KIOSK_USER="kiosk"
 KIOSK_HOME="/home/${KIOSK_USER}"
@@ -24,17 +23,8 @@ sudo apt-get install -y \
     python3-flask \
     python3-gpiozero
 
-# ── 2. 스크립트 다운로드 ──────────────────────────────────────────────────────
-echo "[2/7] 스크립트 다운로드 중..."
-mkdir -p "$DAEMON_DIR"
-
-for file in start-door-lock.sh stop-door-lock.sh door-lock-daemon.py README.md; do
-    curl -fsSL "${REPO_RAW}/${file}" -o "${DAEMON_DIR}/${file}"
-    echo "  다운로드 완료: ${file}"
-done
-
-# ── 3. 사용자 및 그룹 설정 ────────────────────────────────────────────────────
-echo "[3/7] 사용자 및 그룹 설정 중..."
+# ── 2. 사용자 및 그룹 설정 ────────────────────────────────────────────────────
+echo "[2/7] 사용자 및 그룹 설정 중..."
 
 # door-lock 그룹 생성
 if ! getent group "$DOOR_LOCK_GROUP" > /dev/null; then
@@ -44,15 +34,16 @@ else
     echo "  그룹 이미 존재: ${DOOR_LOCK_GROUP}"
 fi
 
-# kiosk 사용자 생성 (sudo 없음, door-lock 기본 그룹)
+# kiosk 사용자 생성 (sudo 없음, door-lock 기본 그룹, 홈 디렉토리 = 데몬 디렉토리)
 if ! id "$KIOSK_USER" > /dev/null 2>&1; then
     sudo useradd \
         --create-home \
+        --home-dir "$KIOSK_HOME" \
         --shell /bin/bash \
         --gid "$DOOR_LOCK_GROUP" \
         --no-user-group \
         "$KIOSK_USER"
-    echo "  사용자 생성: ${KIOSK_USER}"
+    echo "  사용자 생성: ${KIOSK_USER} (홈: ${KIOSK_HOME})"
 else
     echo "  사용자 이미 존재: ${KIOSK_USER}"
 fi
@@ -73,9 +64,22 @@ else
     echo "  ${SETUP_USER}: ${DOOR_LOCK_GROUP} 그룹 이미 설정됨"
 fi
 
-# 스크립트 파일 소유권 및 권한 설정 (door-lock 그룹만 읽기/실행)
-sudo chown -R "${SETUP_USER}:${DOOR_LOCK_GROUP}" "$DAEMON_DIR"
-sudo chmod -R 750 "$DAEMON_DIR"
+# ── 3. 스크립트 다운로드 (kiosk 홈 = 데몬 디렉토리) ──────────────────────────
+echo "[3/7] 스크립트 다운로드 중..."
+
+for file in setup-door-lock.sh start-door-lock.sh stop-door-lock.sh door-lock-daemon.py README.md; do
+    sudo rm -f "${KIOSK_HOME}/${file}"
+    sudo curl -fsSL "${REPO_RAW}/${file}" -o "${KIOSK_HOME}/${file}"
+    echo "  다운로드 완료: ${file}"
+done
+
+sudo chown -R "${KIOSK_USER}:${DOOR_LOCK_GROUP}" "$KIOSK_HOME"
+sudo chmod 770 "$KIOSK_HOME"
+sudo chmod 770 "${KIOSK_HOME}/setup-door-lock.sh"
+sudo chmod 770 "${KIOSK_HOME}/start-door-lock.sh"
+sudo chmod 770 "${KIOSK_HOME}/stop-door-lock.sh"
+sudo chmod 770 "${KIOSK_HOME}/door-lock-daemon.py"
+sudo chmod 660 "${KIOSK_HOME}/README.md"
 
 # ── 4. PWA 설치 정책 설정 ─────────────────────────────────────────────────────
 echo "[4/7] PWA 설치 정책 설정 중..."
@@ -113,7 +117,8 @@ if ! sudo grep -qF "$BASHRC_MARK" "${KIOSK_HOME}/.bashrc" 2>/dev/null; then
 
 # door-lock: auto startx
 if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-    exec startx
+    startx
+    sleep infinity
 fi
 EOF
     echo "  .bashrc에 startx 설정 추가"
@@ -124,13 +129,13 @@ fi
 # kiosk의 .xinitrc: X 세션 시작 시 start-door-lock.sh 실행
 sudo tee "${KIOSK_HOME}/.xinitrc" > /dev/null << EOF
 #!/bin/bash
-exec "${DAEMON_DIR}/start-door-lock.sh"
+exec "${KIOSK_HOME}/start-door-lock.sh"
 EOF
 sudo chmod +x "${KIOSK_HOME}/.xinitrc"
 sudo chown "${KIOSK_USER}:${DOOR_LOCK_GROUP}" "${KIOSK_HOME}/.bashrc" "${KIOSK_HOME}/.xinitrc"
 echo "  .xinitrc 설정 완료"
 
-# ── 7. GPIO 권한 설정 ─────────────────────────────────────────────────────────
+# ── 7. GPIO 권한 확인 ─────────────────────────────────────────────────────────
 echo "[7/7] GPIO 권한 확인 중..."
 if ! groups "$KIOSK_USER" | grep -q '\bgpio\b'; then
     echo "  경고: gpio 그룹이 없습니다. python3-rpi.gpio 또는 python3-gpiozero 설치를 확인하세요." >&2
