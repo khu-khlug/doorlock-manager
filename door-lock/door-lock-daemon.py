@@ -68,7 +68,8 @@ def unlock():
     relay.on()
     time.sleep(UNLOCK_DURATION)
     relay.off()
-    return cors(jsonify({"message": "ok"}))
+    name = (resp.json().get("name") or "") if resp.content else ""
+    return cors(jsonify({"message": "ok", "name": name}))
 
 
 if __name__ == "__main__":

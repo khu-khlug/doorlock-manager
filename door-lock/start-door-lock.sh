@@ -25,6 +25,7 @@ else
     xset s "$BLANK_TIMEOUT" "$BLANK_TIMEOUT"
     xset dpms "$BLANK_TIMEOUT" "$BLANK_TIMEOUT" "$BLANK_TIMEOUT"
 fi
+xrandr --output DSI-1 --rotate inverted
 unclutter -idle 0 &  # 마우스 커서 끔
 
 # ── 3. Chromium 키오스크 실행 ─────────────────────────────────────────────────

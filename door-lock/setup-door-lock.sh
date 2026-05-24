@@ -11,7 +11,8 @@ KIOSK_USER="kiosk"
 KIOSK_HOME="/home/${KIOSK_USER}"
 DOOR_LOCK_GROUP="door-lock"
 DAEMON_SVC_USER="door-lock-svc"
-PWA_URL="https://feat-door-lock.khlug-dev.pages.dev/door-lock"
+PWA_ORIGIN="https://feat-door-lock.khlug-dev.pages.dev"
+PWA_URL="${PWA_ORIGIN}/door-lock"
 BACKEND_URL="https://api.dev.khlugy.app"
 
 # ── 1. 시스템 패키지 설치 ─────────────────────────────────────────────────────
@@ -165,8 +166,10 @@ sudo tee /etc/chromium/policies/managed/pwa_install.json > /dev/null << EOF
     }
   ],
   "InsecurePrivateNetworkRequestsAllowedForUrls": [
-    "${PWA_URL}"
-  ]
+    "${PWA_ORIGIN}"
+  ],
+  "DeveloperToolsAvailability": 2,
+  "TranslateEnabled": false
 }
 EOF
 
