@@ -4,7 +4,7 @@
 
 set -e
 
-REPO_RAW="https://raw.githubusercontent.com/nananina0415/sight-infra/test/door-lock/door-lock"
+REPO_RAW="https://raw.githubusercontent.com/khu-khlug/sight-infra/main/door-lock"
 SETUP_USER="${SUDO_USER:-$(whoami)}"
 SETUP_DIR="$(cd "$(dirname "$0")" && pwd)"
 KIOSK_USER="kiosk"
@@ -16,7 +16,7 @@ PWA_URL="${PWA_ORIGIN}/door-lock"
 BACKEND_URL="https://api-v2.khlug.org"
 
 # ── 1. 시스템 패키지 설치 ─────────────────────────────────────────────────────
-echo "[1/11] 시스템 패키지 설치 중..."
+echo "[1/10] 시스템 패키지 설치 중..."
 sudo apt-get update -qq
 sudo apt-get install -y \
     xserver-xorg \
@@ -49,7 +49,7 @@ EOF
 sudo fc-cache -f
 
 # ── 2. 사용자 및 그룹 설정 ────────────────────────────────────────────────────
-echo "[2/11] 사용자 및 그룹 설정 중..."
+echo "[2/10] 사용자 및 그룹 설정 중..."
 
 # door-lock 그룹 생성
 if ! getent group "$DOOR_LOCK_GROUP" > /dev/null; then
@@ -110,7 +110,7 @@ else
 fi
 
 # ── 3. 스크립트 다운로드 (kiosk 홈 = 파일 디렉토리) ──────────────────────────
-echo "[3/11] 스크립트 다운로드 중..."
+echo "[3/10] 스크립트 다운로드 중..."
 
 for file in setup-door-lock.sh start-door-lock.sh stop-door-lock.sh door-lock-daemon.py README.md; do
     sudo rm -f "${KIOSK_HOME}/${file}"
@@ -127,7 +127,7 @@ sudo chmod 770 "${KIOSK_HOME}/door-lock-daemon.py"
 sudo chmod 660 "${KIOSK_HOME}/README.md"
 
 # ── 4. API 키 설정 ────────────────────────────────────────────────────────────
-echo "[4/11] API 키 설정 중..."
+echo "[4/10] API 키 설정 중..."
 
 KEY_SRC="${SETUP_DIR}/internal-api-key"
 API_KEY_DIR="/etc/door-lock"
@@ -180,7 +180,7 @@ sudo tee /etc/chromium/policies/managed/pwa_install.json > /dev/null << EOF
 EOF
 
 # ── 6. 자동 로그인 설정 (kiosk 사용자) ───────────────────────────────────────
-echo "[6/11] 자동 로그인 설정 중..."
+echo "[6/10] 자동 로그인 설정 중..."
 GETTY_CONF="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 sudo mkdir -p "$(dirname "$GETTY_CONF")"
 sudo tee "$GETTY_CONF" > /dev/null << EOF
@@ -192,7 +192,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable getty@tty1.service
 
 # ── 7. X 세션 자동 시작 설정 (kiosk 홈 디렉토리) ─────────────────────────────
-echo "[7/11] X 세션 자동 시작 설정 중..."
+echo "[7/10] X 세션 자동 시작 설정 중..."
 
 # kiosk의 .bashrc: tty1 로그인 시 startx 실행
 BASHRC_MARK="# door-lock: auto startx"
@@ -219,7 +219,7 @@ sudo chown "${KIOSK_USER}:${DOOR_LOCK_GROUP}" "${KIOSK_HOME}/.bashrc" "${KIOSK_H
 echo "  .xinitrc 설정 완료"
 
 # ── 8. 디스플레이 절전 cron 등록 ─────────────────────────────────────────────
-echo "[8/11] 디스플레이 절전 cron 등록 중..."
+echo "[8/10] 디스플레이 절전 cron 등록 중..."
 CRON_MARK="# door-lock: display power"
 if ! sudo crontab -u "$KIOSK_USER" -l 2>/dev/null | grep -qF "$CRON_MARK"; then
     (sudo crontab -u "$KIOSK_USER" -l 2>/dev/null; \
@@ -233,7 +233,7 @@ else
 fi
 
 # ── 9. 데몬 systemd 서비스 등록 ──────────────────────────────────────────────
-echo "[9/11] 데몬 systemd 서비스 등록 중..."
+echo "[9/10] 데몬 systemd 서비스 등록 중..."
 SERVICE_FILE="/etc/systemd/system/door-lock-daemon.service"
 sudo tee "$SERVICE_FILE" > /dev/null << EOF
 [Unit]
@@ -257,21 +257,11 @@ sudo systemctl restart door-lock-daemon.service
 echo "  door-lock-daemon.service 등록 및 시작 완료"
 
 # ── 10. GPIO 권한 확인 ────────────────────────────────────────────────────────
-echo "[10/11] GPIO 권한 확인 중..."
+echo "[10/10] GPIO 권한 확인 중..."
 if ! groups "$DAEMON_SVC_USER" | grep -q '\bgpio\b'; then
     echo "  경고: ${DAEMON_SVC_USER}에 gpio 그룹이 없습니다." >&2
 else
     echo "  gpio 권한 정상"
-fi
-
-# ── 11. DSI 디스플레이 180도 회전 설정 ───────────────────────────────────────
-echo "[11/11] DSI 디스플레이 회전 설정 중..."
-BOOT_CONFIG="/boot/config.txt"
-if ! grep -qF "lcd_rotate=2" "$BOOT_CONFIG" 2>/dev/null; then
-    echo "lcd_rotate=2" | sudo tee -a "$BOOT_CONFIG" > /dev/null
-    echo "  lcd_rotate=2 추가 완료"
-else
-    echo "  lcd_rotate=2 이미 설정됨, 건너뜀"
 fi
 
 echo ""
