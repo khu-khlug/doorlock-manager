@@ -11,9 +11,9 @@ KIOSK_USER="kiosk"
 KIOSK_HOME="/home/${KIOSK_USER}"
 DOOR_LOCK_GROUP="door-lock"
 DAEMON_SVC_USER="door-lock-svc"
-PWA_ORIGIN="https://feat-door-lock.khlug-dev.pages.dev"
+PWA_ORIGIN="https://app.khlug.org"
 PWA_URL="${PWA_ORIGIN}/door-lock"
-BACKEND_URL="https://api.dev.khlugy.app"
+BACKEND_URL="https://api-v2.khlug.org"
 
 # ── 1. 시스템 패키지 설치 ─────────────────────────────────────────────────────
 echo "[1/11] 시스템 패키지 설치 중..."
@@ -155,7 +155,7 @@ echo "     $(cat "$KEY_SRC")"
 echo ""
 
 # ── 5. PWA 설치 정책 설정 ─────────────────────────────────────────────────────
-echo "[5/11] PWA 설치 정책 설정 중..."
+echo "[5/10] PWA 설치 정책 설정 중..."
 sudo rm -rf "${KIOSK_HOME}/.config/chromium"
 echo "  Chromium 프로필 초기화 (PWA 캐시 및 로컬 스토리지 삭제)"
 sudo mkdir -p /etc/chromium/policies/managed
