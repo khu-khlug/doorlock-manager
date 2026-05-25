@@ -15,6 +15,7 @@ with open("/etc/door-lock/api-key") as f:
     INTERNAL_API_KEY = f.read().strip()
 
 BACKEND_URL = os.environ["BACKEND_URL"]
+ROOM_NUMBER = int(os.environ["ROOM_NUMBER"])
 
 relay = OutputDevice(GPIO_PIN, active_high=True, initial_value=False)
 app = Flask(__name__)
@@ -57,7 +58,7 @@ def unlock():
     try:
         resp = requests.post(
             f"{BACKEND_URL}/internal/door-lock/accesses",
-            json={"studentId": int(student_id)},
+            json={"studentId": int(student_id), "roomNumber": ROOM_NUMBER},
             headers={"x-api-key": INTERNAL_API_KEY},
             timeout=5,
         )

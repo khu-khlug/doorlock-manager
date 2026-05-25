@@ -4,6 +4,8 @@
 
 set -e
 
+read -rp "방 번호를 입력하세요 (숫자 3자리): " ROOM_NUMBER
+
 REPO_RAW="https://raw.githubusercontent.com/khu-khlug/sight-infra/main/door-lock"
 SETUP_USER="${SUDO_USER:-$(whoami)}"
 SETUP_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -244,6 +246,7 @@ After=network.target
 Type=simple
 User=${DAEMON_SVC_USER}
 Environment=BACKEND_URL=${BACKEND_URL}
+Environment=ROOM_NUMBER=${ROOM_NUMBER}
 ExecStart=python3 ${KIOSK_HOME}/door-lock-daemon.py
 Restart=on-failure
 RestartSec=5

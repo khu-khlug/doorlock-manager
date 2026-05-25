@@ -10,6 +10,7 @@ fi
 DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)"
 PWA_URL="https://app.khlug.org/door-lock"
 BLANK_TIMEOUT=300          # 야간 화면 절전 시간 (초, 21:00~09:00)
+TOUCH_CHIP="ft5x06"        # 터치스크린 칩 모델명 (xinput 장치 탐색용)
 
 # ── 1. 기존 프로세스 종료 ─────────────────────────────────────────────────────
 echo "[1/3] 기존 프로세스 종료 중..."
@@ -26,7 +27,7 @@ else
     xset dpms "$BLANK_TIMEOUT" "$BLANK_TIMEOUT" "$BLANK_TIMEOUT"
 fi
 xrandr --output DSI-1 --rotate inverted
-TOUCH_ID=$(xinput list | grep -i "ft5x06" | grep -oP 'id=\K[0-9]+' | head -1)
+TOUCH_ID=$(xinput list | grep -i "$TOUCH_CHIP" | grep -oP 'id=\K[0-9]+' | head -1)
 if [ -n "$TOUCH_ID" ]; then
     xinput set-prop "$TOUCH_ID" "Coordinate Transformation Matrix" -1 0 1 0 -1 1 0 0 1
 fi
