@@ -18,7 +18,7 @@ echo "백엔드_SYSTEM_API_키값" > ./internal-api-key
 그 다음 셋업 스크립트를 같은 폴더에서 실행한다. 실행 시 방 번호(숫자 3자리)를 대화식으로 입력한다.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/khu-khlug/doorlock-manager/main/setup-door-lock.sh -o setup-door-lock.sh
+curl -fsSL https://raw.githubusercontent.com/khu-khlug/doorlock-manager/dev/setup-door-lock.sh -o setup-door-lock.sh
 chmod +x setup-door-lock.sh
 sudo ./setup-door-lock.sh
 ```

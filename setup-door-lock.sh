@@ -6,16 +6,16 @@ set -e
 
 read -rp "방 번호를 입력하세요 (숫자 3자리): " ROOM_NUMBER
 
-REPO_RAW="https://raw.githubusercontent.com/khu-khlug/doorlock-manager/main"
+REPO_RAW="https://raw.githubusercontent.com/khu-khlug/doorlock-manager/dev"
 SETUP_USER="${SUDO_USER:-$(whoami)}"
 SETUP_DIR="$(cd "$(dirname "$0")" && pwd)"
 KIOSK_USER="kiosk"
 KIOSK_HOME="/home/${KIOSK_USER}"
 DOOR_LOCK_GROUP="door-lock"
 DAEMON_SVC_USER="door-lock-svc"
-PWA_ORIGIN="https://app.khlug.org"
+PWA_ORIGIN="https://feat-door-lock.khlug-dev.pages.dev"
 PWA_URL="${PWA_ORIGIN}/door-lock"
-BACKEND_URL="https://api-v2.khlug.org"
+BACKEND_URL="https://api.dev.khlugy.app"
 
 # ── 1. 시스템 패키지 설치 ─────────────────────────────────────────────────────
 echo "[1/10] 시스템 패키지 설치 중..."

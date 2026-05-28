@@ -8,7 +8,7 @@ if [ -z "$DISPLAY" ]; then
 fi
 
 DAEMON_DIR="$(cd "$(dirname "$0")" && pwd)"
-PWA_URL="https://app.khlug.org/door-lock"
+PWA_URL="https://feat-door-lock.khlug-dev.pages.dev/door-lock"
 BLANK_TIMEOUT=300          # 야간 화면 절전 시간 (초, 21:00~09:00)
 TOUCH_CHIP="ft5x06"        # 터치스크린 칩 모델명 (xinput 장치 탐색용)
 
