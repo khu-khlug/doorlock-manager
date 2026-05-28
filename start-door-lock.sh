@@ -27,7 +27,7 @@ else
     xset dpms "$BLANK_TIMEOUT" "$BLANK_TIMEOUT" "$BLANK_TIMEOUT"
 fi
 xrandr --output DSI-1 --rotate inverted
-TOUCH_ID=$(xinput list | grep -i "$TOUCH_CHIP" | grep -oP 'id=\K[0-9]+' | head -1)
+TOUCH_ID=$(xinput list 2>/dev/null | grep -i "$TOUCH_CHIP" | grep -oP 'id=\K[0-9]+' | head -1)
 if [ -n "$TOUCH_ID" ]; then
     xinput set-prop "$TOUCH_ID" "Coordinate Transformation Matrix" -1 0 1 0 -1 1 0 0 1
 fi

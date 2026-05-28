@@ -24,6 +24,7 @@ sudo apt-get install -y \
     xserver-xorg \
     xinit \
     x11-xserver-utils \
+    xinput \
     chromium \
     unclutter \
     python3-flask \
