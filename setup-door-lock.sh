@@ -18,7 +18,7 @@ PWA_URL="${PWA_ORIGIN}/door-lock"
 BACKEND_URL="https://api.dev.khlugy.app"
 
 # ── 1. Install system packages ────────────────────────────────────────────────
-echo "[1/10] Installing system packages..."
+echo "[1/11] Installing system packages..."
 sudo apt-get update -qq
 sudo apt-get install -y \
     xserver-xorg \
@@ -47,7 +47,7 @@ EOF
 sudo fc-cache -f
 
 # ── 2. User and group setup ───────────────────────────────────────────────────
-echo "[2/10] Setting up users and groups..."
+echo "[2/11] Setting up users and groups..."
 
 if ! getent group "$DOOR_LOCK_GROUP" > /dev/null; then
     sudo groupadd "$DOOR_LOCK_GROUP"
@@ -102,7 +102,7 @@ else
 fi
 
 # ── 3. Download scripts ───────────────────────────────────────────────────────
-echo "[3/10] Downloading scripts..."
+echo "[3/11] Downloading scripts..."
 
 for file in setup-door-lock.sh start-door-lock.sh stop-door-lock.sh door-lock-daemon.py README.md; do
     sudo rm -f "${KIOSK_HOME}/${file}"
@@ -119,7 +119,7 @@ sudo chmod 770 "${KIOSK_HOME}/door-lock-daemon.py"
 sudo chmod 660 "${KIOSK_HOME}/README.md"
 
 # ── 4. API key setup ──────────────────────────────────────────────────────────
-echo "[4/10] Setting up API key..."
+echo "[4/11] Setting up API key..."
 
 KEY_SRC="${SETUP_DIR}/internal-api-key"
 API_KEY_DIR="/etc/door-lock"
@@ -147,7 +147,7 @@ echo "     $(cat "$KEY_SRC")"
 echo ""
 
 # ── 5. PWA install policy ─────────────────────────────────────────────────────
-echo "[5/10] Configuring PWA install policy..."
+echo "[5/11] Configuring PWA install policy..."
 sudo rm -rf "${KIOSK_HOME}/.config/chromium"
 echo "  Chromium profile reset (PWA cache and local storage cleared)"
 sudo mkdir -p /etc/chromium/policies/managed
@@ -172,7 +172,7 @@ sudo tee /etc/chromium/policies/managed/pwa_install.json > /dev/null << EOF
 EOF
 
 # ── 6. Auto-login setup ───────────────────────────────────────────────────────
-echo "[6/10] Configuring auto-login..."
+echo "[6/11] Configuring auto-login..."
 GETTY_CONF="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 sudo mkdir -p "$(dirname "$GETTY_CONF")"
 sudo tee "$GETTY_CONF" > /dev/null << EOF
@@ -184,7 +184,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable getty@tty1.service
 
 # ── 7. X session auto-start ───────────────────────────────────────────────────
-echo "[7/10] Configuring X session auto-start..."
+echo "[7/11] Configuring X session auto-start..."
 
 BASHRC_MARK="# door-lock: auto startx"
 if ! sudo grep -qF "$BASHRC_MARK" "${KIOSK_HOME}/.bashrc" 2>/dev/null; then
@@ -209,7 +209,7 @@ sudo chown "${KIOSK_USER}:${DOOR_LOCK_GROUP}" "${KIOSK_HOME}/.bashrc" "${KIOSK_H
 echo "  .xinitrc configured"
 
 # ── 8. Display sleep cron ─────────────────────────────────────────────────────
-echo "[8/10] Registering display sleep cron..."
+echo "[8/11] Registering display sleep cron..."
 CRON_MARK="# door-lock: display power"
 if ! sudo crontab -u "$KIOSK_USER" -l 2>/dev/null | grep -qF "$CRON_MARK"; then
     (sudo crontab -u "$KIOSK_USER" -l 2>/dev/null; \
