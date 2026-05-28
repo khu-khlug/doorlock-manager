@@ -97,8 +97,10 @@ def cors(response):
     return response
 
 
-@app.route("/health")
+@app.route("/health", methods=["GET", "OPTIONS"])
 def health():
+    if request.method == "OPTIONS":
+        return cors(make_response("", 204))
     return cors(jsonify({"status": "ok"}))
 
 

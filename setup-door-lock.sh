@@ -222,8 +222,14 @@ else
     echo "  Cron already registered, skipping"
 fi
 
-# ── 9. Register daemon systemd service ────────────────────────────────────────
-echo "[9/10] Registering daemon systemd service..."
+# ── 9. Create daemon runtime directories ─────────────────────────────────────
+echo "[9/11] Creating daemon runtime directories..."
+sudo mkdir -p /var/log/door-lock /var/cache/door-lock
+sudo chown "${DAEMON_SVC_USER}:${DAEMON_SVC_USER}" /var/log/door-lock /var/cache/door-lock
+echo "  /var/log/door-lock and /var/cache/door-lock created"
+
+# ── 10. Register daemon systemd service ───────────────────────────────────────
+echo "[10/11] Registering daemon systemd service..."
 SERVICE_FILE="/etc/systemd/system/door-lock-daemon.service"
 sudo tee "$SERVICE_FILE" > /dev/null << EOF
 [Unit]
@@ -247,8 +253,8 @@ sudo systemctl enable door-lock-daemon.service
 sudo systemctl restart door-lock-daemon.service
 echo "  door-lock-daemon.service registered and started"
 
-# ── 10. Check GPIO permissions ────────────────────────────────────────────────
-echo "[10/10] Checking GPIO permissions..."
+# ── 11. Check GPIO permissions ────────────────────────────────────────────────
+echo "[11/11] Checking GPIO permissions..."
 if ! groups "$DAEMON_SVC_USER" | grep -q '\bgpio\b'; then
     echo "  WARNING: ${DAEMON_SVC_USER} is not in the gpio group" >&2
 else
