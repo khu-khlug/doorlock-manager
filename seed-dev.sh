@@ -16,8 +16,8 @@ exec_sql "
 INSERT INTO khlug_members
   (id, name, number, admission, realname, college, grade, state, expoint, active, manager, khuisauth_at, updated_at, created_at, last_login, last_enter)
 VALUES
-  (1, 'member',  20240001, '24', '일반회원', '정보대학', 2, 1, 0, 1, 0, NOW(), NOW(), NOW(), NOW(), NOW()),
-  (2, 'manager', 20240002, '24', '관리자',   '정보대학', 4, 1, 0, 1, 1, NOW(), NOW(), NOW(), NOW(), NOW())
+  (1, 'member',  2024000001, '24', '일반회원', '정보대학', 2, 1, 0, 1, 0, NOW(), NOW(), NOW(), NOW(), NOW()),
+  (2, 'manager', 2024000002, '24', '관리자',   '정보대학', 4, 1, 0, 1, 1, NOW(), NOW(), NOW(), NOW(), NOW())
 ON DUPLICATE KEY UPDATE manager = VALUES(manager);
 "
 
