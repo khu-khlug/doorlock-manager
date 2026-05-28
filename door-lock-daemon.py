@@ -15,6 +15,7 @@ PORT = 8080
 LOG_FILE = "/var/log/door-lock/daemon.log"
 SCHEDULE_CACHE_FILE = "/var/cache/door-lock/schedules.json"
 SCHEDULE_REFRESH_INTERVAL = 3600  # 1시간
+SCHEDULE_RETRY_INTERVAL = 600    # 실패 시 10분 후 재시도
 
 with open("/etc/door-lock/api-key") as f:
     INTERNAL_API_KEY = f.read().strip()
@@ -66,6 +67,7 @@ def _save_cache_to_file(schedules):
 def _refresh_schedules():
     now = datetime.now(timezone.utc)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    success = False
     try:
         resp = requests.get(
             f"{BACKEND_URL}/schedules",
@@ -79,12 +81,14 @@ def _refresh_schedules():
                 _schedule_cache[:] = schedules
             _save_cache_to_file(schedules)
             logger.info("schedules refreshed count=%d", len(schedules))
+            success = True
         else:
             logger.warning("schedule refresh failed status=%d", resp.status_code)
     except Exception as e:
         logger.error("schedule refresh error: %s", e)
 
-    t = threading.Timer(SCHEDULE_REFRESH_INTERVAL, _refresh_schedules)
+    next_interval = SCHEDULE_REFRESH_INTERVAL if success else SCHEDULE_RETRY_INTERVAL
+    t = threading.Timer(next_interval, _refresh_schedules)
     t.daemon = True
     t.start()
 
