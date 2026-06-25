@@ -1,18 +1,18 @@
 #!/bin/bash
 
 
-# ── 프로세스 종료 헬퍼 ────────────────────────────────────────────────────────
-# 용법: stop_process <pgrep 패턴> <표시 이름>
+# ── Process stop helper ───────────────────────────────────────────────────────
+# Usage: stop_process <pgrep pattern> <display name>
 stop_process() {
     local pattern="$1"
     local name="$2"
 
     if ! pgrep -f "$pattern" > /dev/null 2>&1; then
-        echo "  ${name}: 실행 중 아님, 건너뜀"
+        echo "  ${name}: not running, skipping"
         return 0
     fi
 
-    echo "  ${name}: 종료 요청 (SIGTERM)..."
+    echo "  ${name}: sending SIGTERM..."
     pkill -TERM -f "$pattern" 2>/dev/null || true
 
     local elapsed=0
@@ -20,7 +20,7 @@ stop_process() {
         sleep 1
         elapsed=$((elapsed + 1))
         if [ "$elapsed" -ge 10 ]; then
-            echo "  ${name}: 응답 없음, 강제 종료 (SIGKILL)..."
+            echo "  ${name}: not responding, sending SIGKILL..."
             pkill -KILL -f "$pattern" 2>/dev/null || true
             sleep 1
             break
@@ -28,14 +28,14 @@ stop_process() {
     done
 
     if pgrep -f "$pattern" > /dev/null 2>&1; then
-        echo "  ${name}: 종료 실패" >&2
+        echo "  ${name}: failed to stop" >&2
         return 1
     fi
 
-    echo "  ${name}: 종료 완료"
+    echo "  ${name}: stopped"
 }
 
-# ── 기존 프로세스 종료 ────────────────────────────────────────────────────────
-echo "[stop] 기존 프로세스 종료 중..."
+# ── Stop existing processes ───────────────────────────────────────────────────
+echo "[stop] Stopping existing processes..."
 stop_process "chromium" "Chromium"
 stop_process "unclutter" "unclutter"
