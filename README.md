@@ -113,6 +113,8 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
   - `127.0.0.1`에서만 요청 수락
   - 백엔드 타임아웃 5초, 실패 시 504/502 반환
 - 출입 시도·성공·실패를 `/var/log/door-lock/daemon.log`에 기록 (5MB × 3개 순환)
+- 백엔드 인증 + 릴레이 개방 로직은 `attempt_unlock(endpoint, payload, source)` 함수로 공용화되어 있다. `/unlock`(`source="typing"`, 학번 직접 입력)이 현재 유일한 호출부이며, 카드/블루투스 태깅처럼 GPIO나 USB 등으로 들어오는 신호 기반 인증(`source="tagging"`)을 추가할 때도 이 함수를 그대로 재사용한다.
+- `start_reader()`는 태깅 신호 감시를 위한 확장 지점이다. 신호 종류(GPIO/USB 등)와 프로토콜, 백엔드 payload 스펙이 아직 정해지지 않아 현재는 빈 함수(no-op)이며, `__main__`에서 이미 호출되도록 연결만 해둔 상태다. 확정되면 이 함수 내부에서 신호를 감시하다가 `attempt_unlock(endpoint, payload, source="tagging")`을 호출하도록 구현하면 된다.
 
 ---
 
@@ -145,3 +147,5 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
 - 백엔드 URL은 `BACKEND_URL` 환경변수로 주입되며 `setup-door-lock.sh`가 자동으로 설정한다.
 - 방 번호는 `ROOM_NUMBER` 환경변수로 주입되며 `setup-door-lock.sh` 실행 시 대화식으로 입력받아 설정한다.
 - 로그 파일 경로는 `LOG_FILE` 상수로 지정되어 있으며 디렉토리가 없으면 자동 생성된다.
+- 태깅(카드/블루투스 등) 기반 인증을 추가할 때는 `start_reader()` 함수 내부만 구현하면 된다. 새 클래스나 등록 구조를 만들 필요 없이, 신호를 감시하다가 `attempt_unlock(endpoint, payload, source="tagging")`을 호출하는 것으로 충분하다 — 리더는 항상 하나만 운용하므로 여러 구현체를 갈아끼우는 구조는 불필요하다.
+- 백엔드 API 스펙이 태깅 인증을 위해 바뀌면(새 엔드포인트 또는 기존 엔드포인트의 payload 확장) `start_reader()`가 `attempt_unlock`에 넘기는 `endpoint`/`payload` 값만 그에 맞게 구성하면 되고, `attempt_unlock`/`request_backend_authorization` 자체는 손댈 필요 없다.

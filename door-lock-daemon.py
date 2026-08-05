@@ -6,8 +6,10 @@ import time
 import os
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Optional
 
 GPIO_PIN = 18
 UNLOCK_DURATION = 0.1  # 초 (레거시 open.py 기준)
@@ -101,6 +103,54 @@ def cors(response):
     return response
 
 
+@dataclass
+class BackendResult:
+    kind: str  # "ok" | "denied" | "timeout" | "network_error"
+    status_code: Optional[int]
+    body: dict
+
+
+def request_backend_authorization(endpoint: str, payload: dict) -> BackendResult:
+    try:
+        resp = requests.post(
+            f"{BACKEND_URL}{endpoint}",
+            json=payload,
+            headers={"x-api-key": INTERNAL_API_KEY},
+            timeout=5,
+        )
+    except requests.exceptions.Timeout:
+        return BackendResult("timeout", None, {})
+    except requests.exceptions.RequestException as e:
+        logger.error("backend network error: %s", e)
+        return BackendResult("network_error", None, {})
+
+    body = resp.json() if resp.content else {}
+    kind = "ok" if resp.status_code == 200 else "denied"
+    return BackendResult(kind, resp.status_code, body)
+
+
+def attempt_unlock(endpoint: str, payload: dict, source: str) -> BackendResult:
+    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 리더 콜백이 공통으로 호출한다."""
+    result = request_backend_authorization(endpoint, payload)
+    if result.kind == "ok":
+        relay.on()
+        time.sleep(UNLOCK_DURATION)
+        relay.off()
+        logger.info("unlocked source=%s name=%s", source, result.body.get("name"))
+    else:
+        logger.info("denied source=%s kind=%s status=%s", source, result.kind, result.status_code)
+    return result
+
+
+def start_reader() -> None:
+    """리더 신호 감시를 시작한다. non-blocking으로 즉시 리턴해야 한다.
+
+    TODO: 신호 종류(GPIO/USB 등)와 프로토콜, 백엔드 payload 구성이 정해지면 구현한다.
+    신호를 받을 때마다 attempt_unlock(endpoint, payload, source="tagging")을 호출하면 된다.
+    """
+    pass
+
+
 @app.route("/health", methods=["GET", "OPTIONS"])
 def health():
     if request.method == "OPTIONS":
@@ -150,30 +200,20 @@ def unlock():
         return cors(jsonify({"message": "studentId required"})), 400
 
     logger.info("unlock attempt student_id=%s", student_id)
-    try:
-        resp = requests.post(
-            f"{BACKEND_URL}/internal/door-lock/accesses",
-            json={"number": int(student_id), "roomNumber": ROOM_NUMBER},
-            headers={"x-api-key": INTERNAL_API_KEY},
-            timeout=5,
-        )
-    except requests.exceptions.Timeout:
-        logger.warning("backend timeout student_id=%s", student_id)
-        return cors(jsonify({"message": "timeout"})), 504
-    except requests.exceptions.RequestException as e:
-        logger.error("backend network error student_id=%s: %s", student_id, e)
-        return cors(jsonify({"message": "network"})), 502
+    result = attempt_unlock(
+        "/internal/door-lock/accesses",
+        {"number": int(student_id), "roomNumber": ROOM_NUMBER},
+        source="typing",
+    )
 
-    if resp.status_code != 200:
-        logger.info("unauthorized student_id=%s status=%s", student_id, resp.status_code)
+    if result.kind == "timeout":
+        return cors(jsonify({"message": "timeout"})), 504
+    if result.kind == "network_error":
+        return cors(jsonify({"message": "network"})), 502
+    if result.kind == "denied":
         return cors(jsonify({"message": "unauthorized"})), 403
 
-    relay.on()
-    time.sleep(UNLOCK_DURATION)
-    relay.off()
-    name = (resp.json().get("name") or "") if resp.content else ""
-    logger.info("unlocked student_id=%s name=%s", student_id, name)
-    return cors(jsonify({"message": "ok", "name": name}))
+    return cors(jsonify({"message": "ok", "name": result.body.get("name") or ""}))
 
 
 if __name__ == "__main__":
@@ -186,4 +226,5 @@ if __name__ == "__main__":
         t.daemon = True
         t.start()
         logger.info("schedules cache valid, next refresh in %.0fs", SCHEDULE_REFRESH_INTERVAL - elapsed)
+    start_reader()
     app.run(host="127.0.0.1", port=PORT, threaded=True)
