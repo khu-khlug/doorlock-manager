@@ -113,8 +113,8 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
   - `127.0.0.1`에서만 요청 수락
   - 백엔드 타임아웃 5초, 실패 시 504/502 반환
 - 출입 시도·성공·실패를 `/var/log/door-lock/daemon.log`에 기록 (5MB × 3개 순환)
-- 백엔드 인증 + 릴레이 개방 로직은 `attempt_unlock(endpoint, payload, source)` 함수로 공용화되어 있다. `/unlock`(`source="typing"`, 학번 직접 입력)과 BLE 태깅(`source="tagging"`, 아래 참고) 양쪽이 이 함수를 공통으로 호출한다.
-- `start_reader()`는 BLE 태깅 인증을 처리한다. 앱이 블루투스 광고로 학번을 보내면 이를 감지해 `attempt_unlock(..., source="tagging")`을 호출하고, 성공하면 문이 열린다. 프로토콜 요약:
+- 백엔드 인증 + 릴레이 개방 로직은 `attempt_unlock(endpoint, payload, source)` 함수로 공용화되어 있다. `/unlock`(`source="keypad"`, 학번 직접 입력)과 블루투스 인증(`source="bluetooth"`, 아래 참고) 양쪽이 이 함수를 공통으로 호출한다.
+- `start_reader()`는 블루투스 인증을 처리한다. 앱이 BLE 광고로 학번을 보내면 이를 감지해 `attempt_unlock(..., source="bluetooth")`을 호출하고, 성공하면 문이 열린다. 프로토콜 요약:
   - Pi는 평소(`idle`) 이미 등록된 기기의 하트비트만 처리한다. 등록 기기가 학번을 담은 저전력 BLE 신호를 계속 보내면, Pi가 그 기기에게 부여한 1바이트 랜덤ID로 응답한다. 30초 이상 하트비트가 없으면 등록 목록에서 제거한다.
   - 트리거 조건(`check_trigger()`, 현재는 항상 `False`인 TODO 스텁)이 만족되면 `triggered` 상태로 전환해 5초간 미등록 기기들의 응답을 모으고, 신호가 가장 강한(문에 가장 가까운) 기기 하나만 `select_closest_candidate()`(현재는 RSSI 최댓값 비교, 정확한 알고리즘은 TODO)로 선택해 등록 + `attempt_unlock` 1회 호출 + 확인 응답을 보낸다. `triggered` 동안은 하트비트를 처리하지 않는다.
   - BLE UUID 4개(`BLE_UUID_PRESENCE`/`BLE_UUID_REGISTER`/`BLE_UUID_CONFIRM`/`BLE_UUID_HEARTBEAT_ACK`)는 16비트이며 아직 TBD 값이다. 실제 값이 정해지면 파일 상단 상수만 교체하면 된다.
@@ -151,8 +151,8 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
 - 백엔드 URL은 `BACKEND_URL` 환경변수로 주입되며 `setup-door-lock.sh`가 자동으로 설정한다.
 - 방 번호는 `ROOM_NUMBER` 환경변수로 주입되며 `setup-door-lock.sh` 실행 시 대화식으로 입력받아 설정한다.
 - 로그 파일 경로는 `LOG_FILE` 상수로 지정되어 있으며 디렉토리가 없으면 자동 생성된다.
-- BLE 태깅은 `start_reader()`가 기동하는 전용 스레드(`_ble_main`)에서 처리한다. 새 클래스나 등록 구조 없이 전부 함수로 구성되어 있다 — 리더는 BLE 하나만 운용하므로 여러 구현체를 갈아끼우는 구조는 불필요하다.
-- 백엔드 API 스펙이 태깅 인증을 위해 바뀌면(새 엔드포인트 또는 기존 엔드포인트의 payload 확장) `_confirm_candidate()`가 `attempt_unlock`에 넘기는 `endpoint`/`payload` 값만 그에 맞게 구성하면 되고, `attempt_unlock`/`request_backend_authorization` 자체는 손댈 필요 없다. 현재는 `/unlock`과 동일한 `/internal/door-lock/accesses` + `{"number", "roomNumber"}`를 그대로 재사용한다는 가정이며, 백엔드팀 확인이 필요하다.
+- 블루투스 인증은 `start_reader()`가 기동하는 전용 스레드(`_ble_main`)에서 처리한다. 새 클래스나 등록 구조 없이 전부 함수로 구성되어 있다 — 인증 수단은 블루투스 하나만 운용하므로 여러 구현체를 갈아끼우는 구조는 불필요하다.
+- 백엔드 API 스펙이 블루투스 인증을 위해 바뀌면(새 엔드포인트 또는 기존 엔드포인트의 payload 확장) `_confirm_candidate()`가 `attempt_unlock`에 넘기는 `endpoint`/`payload` 값만 그에 맞게 구성하면 되고, `attempt_unlock`/`request_backend_authorization` 자체는 손댈 필요 없다. 현재는 `/unlock`과 동일한 `/internal/door-lock/accesses` + `{"number", "roomNumber"}`를 그대로 재사용한다는 가정이며, 백엔드팀 확인이 필요하다.
 - BLE 관련 TODO 스텁 2곳: `check_trigger()`(idle→triggered 전이 조건, 현재 항상 `False`), `select_closest_candidate()`(최근접 기기 판별 알고리즘, 현재는 RSSI 최댓값 임시 구현). 각각 조건/알고리즘이 정해지면 함수 내부만 채우면 된다.
 - BLE UUID(`BLE_UUID_PRESENCE`/`BLE_UUID_REGISTER`/`BLE_UUID_CONFIRM`/`BLE_UUID_HEARTBEAT_ACK`)는 16비트 정수 상수이며 TBD. 랜덤ID는 동시 등록 인원이 255명을 넘지 않는다는 가정하에 1바이트(`BLE_RANDOM_ID_MAX=255`)로 관리한다.
 - `bluezero`/`dbus`/`gi`(PyGObject) 의존성은 `_ble_main()`, `_advertise_start()` 등 BLE 관련 함수 내부에서만 지연 import한다 — 나머지 로직(상태 전이, 후보 선택 등)은 이 라이브러리들이 없는 개발 환경에서도 import/테스트 가능해야 하기 때문이다.

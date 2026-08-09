@@ -19,7 +19,7 @@ SCHEDULE_CACHE_FILE = "/var/cache/door-lock/schedules.json"
 SCHEDULE_REFRESH_INTERVAL = 3600  # 1시간
 SCHEDULE_RETRY_INTERVAL = 600    # 실패 시 10분 후 재시도
 
-# BLE 태깅 설정. UUID는 16비트(2바이트)를 쓰며, 아직 확정되지 않아 TBD 값이다.
+# 블루투스 인증 설정. UUID는 16비트(2바이트)를 쓰며, 아직 확정되지 않아 TBD 값이다.
 # 실제 값이 정해지면 아래 4개만 교체한다.
 BLE_UUID_PRESENCE = 0x1111       # Pi -> 미등록 기기: 트리거 알림
 BLE_UUID_REGISTER = 0x2222       # 기기 -> Pi: 학번 (등록 응답 / 하트비트)
@@ -146,7 +146,7 @@ def request_backend_authorization(endpoint: str, payload: dict) -> BackendResult
 
 
 def attempt_unlock(endpoint: str, payload: dict, source: str) -> BackendResult:
-    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 리더 콜백이 공통으로 호출한다."""
+    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 블루투스 인증 로직이 공통으로 호출한다."""
     result = request_backend_authorization(endpoint, payload)
     if result.kind == "ok":
         relay.on()
@@ -158,7 +158,7 @@ def attempt_unlock(endpoint: str, payload: dict, source: str) -> BackendResult:
     return result
 
 
-# BLE 태깅 상태 (모듈 전역, GLib 메인루프 스레드에서만 변경됨).
+# 블루투스 인증 상태 (모듈 전역, GLib 메인루프 스레드에서만 변경됨).
 _ble_lock = threading.Lock()
 _ble_mode = "idle"  # "idle" | "triggered"
 _registered_devices = {}  # 학번 -> {"random_id": int, "last_heartbeat_at": float}
@@ -276,7 +276,7 @@ def _confirm_candidate(candidate: dict) -> None:
     result = attempt_unlock(
         "/internal/door-lock/accesses",
         {"number": int(student_id), "roomNumber": ROOM_NUMBER},
-        source="tagging",
+        source="bluetooth",
     )
     if result.kind != "ok":
         _return_to_idle()
@@ -488,7 +488,7 @@ def unlock():
     result = attempt_unlock(
         "/internal/door-lock/accesses",
         {"number": int(student_id), "roomNumber": ROOM_NUMBER},
-        source="typing",
+        source="keypad",
     )
 
     if result.kind == "timeout":
