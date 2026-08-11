@@ -44,7 +44,7 @@ API 키는 `/etc/door-lock/api-key`에 저장되며 `door-lock-svc`만 읽을 �
 
 ## 제약 사항
 
-- 네 파일(`setup-door-lock.sh`, `start-door-lock.sh`, `stop-door-lock.sh`, `door-lock-daemon.py`)은 반드시 같은 폴더에 있어야 한다. `start-door-lock.sh`가 같은 디렉토리를 기준으로 나머지 파일을 참조하기 때문.
+- 실행 스크립트와 Python 모듈(`setup-door-lock.sh`, `start-door-lock.sh`, `stop-door-lock.sh`, `door-lock-daemon.py`, `ble_measurement.py`)은 반드시 같은 폴더에 있어야 한다. 설치 스크립트와 데몬이 같은 디렉토리를 기준으로 파일을 참조한다.
 - Raspberry Pi OS 64-bit Lite 기반 (KMS 드라이버 `vc4-kms-v3d` 사용)
 - DSI 디스플레이 사용 시 디스플레이 회전은 `xrandr`로 처리한다. `lcd_rotate` 설정은 KMS 드라이버에서 작동하지 않는다.
 - `/etc/door-lock/api-key`에 저장된 키가 백엔드에서 유효한 `UserRole.SYSTEM` 키여야 한다. 값이 반드시 동일할 필요는 없으며, 백엔드가 비대칭 키 방식을 사용하는 경우 그에 맞는 값을 저장하면 된다.
@@ -58,7 +58,8 @@ some-dir/
 ├── setup-door-lock.sh    # 1. 최초 1회: 패키지 설치 + 파일 다운로드 + 환경 구성
 ├── start-door-lock.sh    # 2. 부팅마다: X 세션 시작 + Chromium 키오스크 실행
 ├── stop-door-lock.sh     # 3. 필요 시: 모든 프로세스 정지
-└── door-lock-daemon.py   # 4. 데몬: Flask HTTP 서버 + GPIO 제어 (systemd 관리)
+├── door-lock-daemon.py   # 4. 데몬: Flask HTTP 서버 + GPIO/BLE 제어 (systemd 관리)
+└── ble_measurement.py    # 선택형 RSSI 저장소·run/CSV CLI·batch uploader
 ```
 
 ### 1. `setup-door-lock.sh` — 최초 설치
@@ -68,7 +69,7 @@ Pi에서 한 번만 실행.
 1. 시스템 패키지 설치 (X11, Chromium, Python Flask, gpiozero, unclutter, fonts-nanum, locales)
 2. 한글 로케일(ko_KR.UTF-8) 및 NanumGothic 기본 폰트 설정
 3. `door-lock` 그룹 및 `kiosk`, `door-lock-svc` 사용자 생성, 그룹 권한 설정
-4. GitHub에서 `start-door-lock.sh`, `stop-door-lock.sh`, `door-lock-daemon.py` 다운로드
+4. GitHub에서 `start-door-lock.sh`, `stop-door-lock.sh`, `door-lock-daemon.py`, `ble_measurement.py` 다운로드
 5. API 키 생성 및 `/etc/door-lock/api-key`에 저장 (백엔드의 `INTERNAL_API_KEY`와 동기화 필요)
 6. Chromium 프로필 초기화 및 정책 설정 (`/etc/chromium/policies/managed/pwa_install.json`)
    - PWA 강제 설치
@@ -119,6 +120,28 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
   - 트리거 조건(`check_trigger()`, 현재는 항상 `False`인 TODO 스텁)이 만족되면 `triggered` 상태로 전환해 5초간 미등록 기기들의 응답을 모으고, 신호가 가장 강한(문에 가장 가까운) 기기 하나만 `select_closest_candidate()`(현재는 RSSI 최댓값 비교, 정확한 알고리즘은 TODO)로 선택해 등록 + `attempt_unlock` 1회 호출 + 확인 응답을 보낸다. `triggered` 동안은 하트비트를 처리하지 않는다.
   - BLE UUID 4개(`BLE_UUID_PRESENCE`/`BLE_UUID_REGISTER`/`BLE_UUID_CONFIRM`/`BLE_UUID_HEARTBEAT_ACK`)는 16비트이며 아직 TBD 값이다. 실제 값이 정해지면 파일 상단 상수만 교체하면 된다.
   - `bluezero` 라이브러리(BlueZ D-Bus 래퍼)로 광고(Broadcaster)와 스캔(Adapter discovery + D-Bus `PropertiesChanged` 구독)을 한 프로세스 안 전용 스레드(GLib 메인루프)에서 함께 처리한다. **광고와 스캔을 동시에 안정적으로 수행할 수 있는지는 실기 검증 전이라 열린 이슈다** (아래 참고).
+
+### 실험용 RSSI 측정
+
+측정은 기본적으로 꺼져 있다. systemd drop-in에 아래 두 환경변수를 설정하면 데몬의 기존 BLE callback이 packet별 실제 RSSI를 SQLite에 비동기로 기록한다. `BLE_MEASUREMENT_HASH_KEY`는 학번을 저장하지 않고 같은 시험 기기를 안정적으로 구분하는 가명 tag를 만드는 키이므로 실험 중에는 바꾸지 않는다.
+
+```ini
+[Service]
+Environment=BLE_MEASUREMENT_DB=/var/cache/door-lock/ble-measurement.sqlite3
+Environment=BLE_MEASUREMENT_HASH_KEY=실험용-비밀값
+```
+
+재시작 후 `status`에서 최근 기기의 가명 tag를 확인하고, 조건을 고정한 run을 시작·종료한다. DB는 `door-lock-svc` 소유이므로 CLI도 같은 사용자로 실행한다.
+
+```bash
+sudo systemctl restart door-lock-daemon
+sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 status
+sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 run start --expected allow --target TAG --position outside-0.5m --carrying hand --orientation facing-pi
+sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 run stop
+sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 export --output /var/cache/door-lock/ble-measurement.csv
+```
+
+원격 전송은 `BLE_MEASUREMENT_ENDPOINT`와 `BLE_MEASUREMENT_TOKEN`을 모두 설정했을 때만 켜진다. 서버가 event ID를 ACK하기 전까지 로컬 관측은 미전송 상태로 남아 재시도된다.
 
 ---
 

@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request, make_response
 from gpiozero import OutputDevice
+import atexit
 import requests
 import threading
 import time
@@ -53,6 +54,8 @@ logger.addHandler(handler)
 
 _schedule_cache = []
 _schedule_lock = threading.Lock()
+_measurement_recorder = None
+_measurement_uploader = None
 
 
 def _parse_iso(s):
@@ -185,6 +188,77 @@ def _parse_service_data(service_data: dict) -> Optional[str]:
     if len(student_id) != BLE_STUDENT_ID_LENGTH or not student_id.isdigit():
         return None
     return student_id
+
+
+def _start_ble_measurement() -> None:
+    """설정된 경우에만 BLE 측정 writer와 선택형 uploader를 시작한다."""
+    database_path = os.environ.get("BLE_MEASUREMENT_DB")
+    if not database_path:
+        return
+    hash_key = os.environ.get("BLE_MEASUREMENT_HASH_KEY")
+    if not hash_key:
+        logger.error("BLE_MEASUREMENT_DB is set but BLE_MEASUREMENT_HASH_KEY is missing")
+        return
+
+    from ble_measurement import (
+        BleMeasurementRecorder,
+        HttpBatchTransport,
+        MeasurementUploader,
+        SQLiteMeasurementStore,
+    )
+
+    global _measurement_recorder, _measurement_uploader
+    try:
+        pi_id = os.environ.get("BLE_MEASUREMENT_PI_ID", f"door-lock-pi-{ROOM_NUMBER}")
+        store = SQLiteMeasurementStore(database_path)
+        recorder = BleMeasurementRecorder(
+            store,
+            pi_id=pi_id,
+            hash_key=hash_key.encode("utf-8"),
+            logger=logger,
+        )
+        recorder.start()
+        _measurement_recorder = recorder
+
+        endpoint = os.environ.get("BLE_MEASUREMENT_ENDPOINT")
+        token = os.environ.get("BLE_MEASUREMENT_TOKEN")
+        if endpoint and token:
+            uploader = MeasurementUploader(
+                store,
+                pi_id=pi_id,
+                transport=HttpBatchTransport(endpoint, token),
+                logger=logger,
+            )
+            uploader.start()
+            _measurement_uploader = uploader
+        elif endpoint:
+            logger.error("BLE_MEASUREMENT_ENDPOINT is set but BLE_MEASUREMENT_TOKEN is missing")
+        logger.info("ble measurement enabled database=%s pi_id=%s", database_path, pi_id)
+    except Exception as error:
+        logger.error("ble measurement initialization failed: %s", error)
+
+
+def _stop_ble_measurement() -> None:
+    if _measurement_uploader is not None:
+        _measurement_uploader.close()
+    if _measurement_recorder is not None:
+        _measurement_recorder.close()
+
+
+def _record_ble_measurement(student_id: str, rssi: Optional[int]) -> None:
+    recorder = _measurement_recorder
+    if recorder is None:
+        return
+    with _ble_lock:
+        phase = _ble_mode
+        packet_kind = "heartbeat" if student_id in _registered_devices else "register"
+    recorder.observe(
+        raw_identifier=student_id.encode("ascii"),
+        packet_kind=packet_kind,
+        service_uuid=_uuid16_to_str(BLE_UUID_REGISTER),
+        rssi=int(rssi) if rssi is not None else None,
+        pi_phase=phase,
+    )
 
 
 def _allocate_random_id() -> int:
@@ -380,7 +454,9 @@ def _handle_ble_scan_result_from_device(dev) -> None:
     """새로 발견된 BLE 기기(bluezero Device)의 최초 ServiceData를 처리한다."""
     student_id = _parse_service_data(dev.service_data or {})
     if student_id is not None:
-        _handle_ble_scan_result(student_id, dev.RSSI or 0)
+        rssi = dev.RSSI
+        _record_ble_measurement(student_id, rssi)
+        _handle_ble_scan_result(student_id, rssi or 0)
 
 
 def _on_bluez_properties_changed(interface, changed, invalidated, path) -> None:
@@ -392,7 +468,9 @@ def _on_bluez_properties_changed(interface, changed, invalidated, path) -> None:
         return
     student_id = _parse_service_data(service_data)
     if student_id is not None:
-        _handle_ble_scan_result(student_id, changed.get("RSSI", 0))
+        rssi = changed.get("RSSI")
+        _record_ble_measurement(student_id, rssi)
+        _handle_ble_scan_result(student_id, rssi or 0)
 
 
 def _start_continuous_ble_discovery(dongle, dbus_module) -> None:
@@ -526,5 +604,7 @@ if __name__ == "__main__":
         t.daemon = True
         t.start()
         logger.info("schedules cache valid, next refresh in %.0fs", SCHEDULE_REFRESH_INTERVAL - elapsed)
+    _start_ble_measurement()
+    atexit.register(_stop_ble_measurement)
     start_reader()
     app.run(host="127.0.0.1", port=PORT, threaded=True)

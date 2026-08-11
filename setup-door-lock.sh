@@ -104,7 +104,7 @@ fi
 # ── 3. Download scripts ───────────────────────────────────────────────────────
 echo "[3/11] Downloading scripts..."
 
-for file in setup-door-lock.sh start-door-lock.sh stop-door-lock.sh door-lock-daemon.py README.md; do
+for file in setup-door-lock.sh start-door-lock.sh stop-door-lock.sh door-lock-daemon.py ble_measurement.py README.md; do
     sudo rm -f "${KIOSK_HOME}/${file}"
     sudo curl -fsSL "${REPO_RAW}/${file}" -o "${KIOSK_HOME}/${file}"
     echo "  Downloaded: ${file}"
@@ -116,6 +116,7 @@ sudo chmod 770 "${KIOSK_HOME}/setup-door-lock.sh"
 sudo chmod 770 "${KIOSK_HOME}/start-door-lock.sh"
 sudo chmod 770 "${KIOSK_HOME}/stop-door-lock.sh"
 sudo chmod 770 "${KIOSK_HOME}/door-lock-daemon.py"
+sudo chmod 770 "${KIOSK_HOME}/ble_measurement.py"
 sudo chmod 660 "${KIOSK_HOME}/README.md"
 
 # ── 4. API key setup ──────────────────────────────────────────────────────────
