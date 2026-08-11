@@ -395,6 +395,21 @@ def _on_bluez_properties_changed(interface, changed, invalidated, path) -> None:
         _handle_ble_scan_result(student_id, changed.get("RSSI", 0))
 
 
+def _start_continuous_ble_discovery(dongle, dbus_module) -> None:
+    """Continuously discover target advertisements without duplicate suppression."""
+    dongle.adapter_methods.SetDiscoveryFilter(
+        {
+            "Transport": dbus_module.String("le"),
+            "UUIDs": dbus_module.Array(
+                [_uuid16_to_str(BLE_UUID_REGISTER)], signature="s"
+            ),
+            # DuplicateData also disables BlueZ's RSSI delta threshold.
+            "DuplicateData": dbus_module.Boolean(True),
+        }
+    )
+    dongle.start_discovery()
+
+
 def _ble_main() -> None:
     """BLE 전용 스레드 진입점. D-Bus GLib 메인루프를 설정하고 계속 실행한다.
 
@@ -421,7 +436,7 @@ def _ble_main() -> None:
         path_keyword="path",
     )
 
-    dongle.nearby_discovery()
+    _start_continuous_ble_discovery(dongle, dbus)
 
     GLib.timeout_add(BLE_TRIGGER_POLL_INTERVAL_MS, _trigger_poll_tick)
     GLib.timeout_add(BLE_HEARTBEAT_ACK_SLOT_MS, _heartbeat_rotation_tick)
