@@ -26,7 +26,10 @@ BLE_UUID_REGISTER = 0x2222       # 기기 -> Pi: 학번 (등록 응답 / 하트�
 BLE_UUID_CONFIRM = 0x3333        # Pi -> 기기: 등록 확인 (학번+랜덤ID)
 BLE_UUID_HEARTBEAT_ACK = 0x4444  # Pi -> 기기: 하트비트 응답 (랜덤ID)
 
-BLE_STUDENT_ID_LENGTH = 10          # 학번 ASCII 자릿수
+BLE_STUDENT_ID_LENGTH = 10                 # 학번 ASCII 자릿수 (디코딩 후 길이)
+BLE_ENCODED_STUDENT_ID_LENGTH = 20         # 앱이 학번을 2바이트씩 뒤바꾼 뒤 16진수로 인코딩한 길이
+BLE_REGISTRATION_PAYLOAD_LENGTH = BLE_ENCODED_STUDENT_ID_LENGTH + 1  # 인코딩 학번 + 공개여부(1바이트)
+BLE_HEARTBEAT_PAYLOAD_LENGTH = 2           # 랜덤ID(1바이트) + 공개여부(1바이트)
 BLE_TRIGGER_WINDOW_SECONDS = 5      # 앱이 등록 신호를 빠르게 반복 송신하는 시간과 동일하게 가정
 BLE_CONFIRM_DURATION_SECONDS = 5    # 등록 확인 광고 유지 시간
 BLE_HEARTBEAT_EXPIRY_SECONDS = 30   # 하트비트가 끊겨 등록 목록에서 제거되는 기준
@@ -161,8 +164,8 @@ def attempt_unlock(endpoint: str, payload: dict, source: str) -> BackendResult:
 # 블루투스 인증 상태 (모듈 전역, GLib 메인루프 스레드에서만 변경됨).
 _ble_lock = threading.Lock()
 _ble_mode = "idle"  # "idle" | "triggered"
-_registered_devices = {}  # 학번 -> {"random_id": int, "last_heartbeat_at": float}
-_candidates = {}          # triggered 중 수집: 학번 -> {"student_id", "rssi", "seen_at"}
+_registered_devices = {}  # 학번 -> {"random_id": int, "last_heartbeat_at": float, "visible": bool}
+_candidates = {}          # triggered 중 수집: 학번 -> {"student_id", "rssi", "seen_at", "visible"}
 _heartbeat_rotation_index = 0
 _active_beacon = None
 _random_id_counter = 0  # 다음에 발급할 랜덤ID. 항상 현재 비어있는 값을 가리킨다.
@@ -173,18 +176,61 @@ def _uuid16_to_str(uuid16: int) -> str:
     return f"0000{uuid16:04x}-0000-1000-8000-00805f9b34fb"
 
 
-def _parse_service_data(service_data: dict) -> Optional[str]:
-    """ServiceData에서 등록 UUID(BLE_UUID_REGISTER)의 학번을 추출한다."""
-    raw = service_data.get(_uuid16_to_str(BLE_UUID_REGISTER))
-    if raw is None:
+def _decode_student_id(encoded: bytes) -> Optional[str]:
+    """앱의 BlePayloadCodec.encodeStudentId() 인코딩을 복원한다.
+    학번 10자리 ASCII를 2바이트씩 맞바꾼 뒤 16진수 20글자로 표현한 것을 원래 학번으로 되돌린다."""
+    if len(encoded) != BLE_ENCODED_STUDENT_ID_LENGTH:
         return None
     try:
-        student_id = bytes(raw).decode("ascii")
+        swapped = bytes.fromhex(encoded.decode("ascii"))
     except (ValueError, UnicodeDecodeError):
+        return None
+    if len(swapped) != BLE_STUDENT_ID_LENGTH:
+        return None
+    unswapped = bytearray(swapped)
+    for i in range(0, BLE_STUDENT_ID_LENGTH, 2):
+        unswapped[i], unswapped[i + 1] = unswapped[i + 1], unswapped[i]
+    try:
+        student_id = bytes(unswapped).decode("ascii")
+    except UnicodeDecodeError:
         return None
     if len(student_id) != BLE_STUDENT_ID_LENGTH or not student_id.isdigit():
         return None
     return student_id
+
+
+def _encode_student_id(student_id: str) -> bytes:
+    """_decode_student_id()의 역변환. Pi가 CONFIRM(3333)에 학번을 실을 때 앱과 같은 인코딩으로 맞춘다."""
+    swapped = bytearray(student_id.encode("ascii"))
+    for i in range(0, BLE_STUDENT_ID_LENGTH, 2):
+        swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+    return bytes(swapped).hex().upper().encode("ascii")
+
+
+def _extract_register_payload(service_data: dict) -> Optional[bytes]:
+    """ServiceData에서 등록 UUID(BLE_UUID_REGISTER)의 원본 payload를 그대로 꺼낸다."""
+    raw = service_data.get(_uuid16_to_str(BLE_UUID_REGISTER))
+    if raw is None:
+        return None
+    return bytes(raw)
+
+
+def _parse_registration_payload(payload: bytes) -> Optional[tuple]:
+    """등록 신호(triggered 중, 인코딩 학번 20바이트 + 공개여부 1바이트 = 21바이트)를 파싱한다."""
+    if len(payload) != BLE_REGISTRATION_PAYLOAD_LENGTH:
+        return None
+    student_id = _decode_student_id(payload[:BLE_ENCODED_STUDENT_ID_LENGTH])
+    if student_id is None:
+        return None
+    visible = payload[BLE_ENCODED_STUDENT_ID_LENGTH] != 0
+    return student_id, visible
+
+
+def _parse_heartbeat_payload(payload: bytes) -> Optional[tuple]:
+    """하트비트 신호(idle 중, 랜덤ID 1바이트 + 공개여부 1바이트 = 2바이트)를 파싱한다."""
+    if len(payload) != BLE_HEARTBEAT_PAYLOAD_LENGTH:
+        return None
+    return payload[0], payload[1] != 0
 
 
 def _allocate_random_id() -> int:
@@ -239,21 +285,41 @@ def check_trigger() -> bool:
     return False
 
 
-def _handle_ble_scan_result(student_id: str, rssi: int) -> None:
-    """등록 UUID 신호 1건을 현재 모드(idle/triggered)에 맞게 처리한다."""
+def _handle_ble_register_signal(payload: bytes, rssi: int) -> None:
+    """등록 UUID(2222) 신호 1건을 payload 길이로 등록/하트비트를 구분해 현재 모드에 맞게 처리한다.
+    triggered 중엔 21바이트(인코딩 학번+공개여부)만 새 후보로 받고,
+    idle 중엔 2바이트(랜덤ID+공개여부)만 등록된 기기의 하트비트로 인정한다."""
     with _ble_lock:
         mode = _ble_mode
-        already_registered = student_id in _registered_devices
+
     if mode == "triggered":
+        parsed = _parse_registration_payload(payload)
+        if parsed is None:
+            return
+        student_id, visible = parsed
+        with _ble_lock:
+            already_registered = student_id in _registered_devices
         # 이미 등록된 기기가 저전력 하트비트를 계속 보내는 중일 수 있으므로,
         # 트리거 윈도우 동안 그 신호를 새 후보로 착각해 재인증/재개방하지 않도록 제외한다.
         if not already_registered:
-            _candidates[student_id] = {"student_id": student_id, "rssi": rssi, "seen_at": time.monotonic()}
+            _candidates[student_id] = {
+                "student_id": student_id,
+                "rssi": rssi,
+                "seen_at": time.monotonic(),
+                "visible": visible,
+            }
         return
+
+    parsed = _parse_heartbeat_payload(payload)
+    if parsed is None:
+        return
+    random_id, visible = parsed
     with _ble_lock:
-        device = _registered_devices.get(student_id)
-        if device is not None:
-            device["last_heartbeat_at"] = time.monotonic()
+        for info in _registered_devices.values():
+            if info["random_id"] == random_id:
+                info["last_heartbeat_at"] = time.monotonic()
+                info["visible"] = visible
+                break
 
 
 def select_closest_candidate(candidates: list) -> Optional[dict]:
@@ -283,11 +349,16 @@ def _confirm_candidate(candidate: dict) -> None:
         return
 
     random_id = _allocate_random_id()
+    visible = candidate.get("visible", True)
     with _ble_lock:
-        _registered_devices[student_id] = {"random_id": random_id, "last_heartbeat_at": time.monotonic()}
+        _registered_devices[student_id] = {
+            "random_id": random_id,
+            "last_heartbeat_at": time.monotonic(),
+            "visible": visible,
+        }
 
-    logger.info("ble registered student_id=%s random_id=%d", student_id, random_id)
-    _advertise_start(BLE_UUID_CONFIRM, student_id.encode("ascii") + bytes([random_id]))
+    logger.info("ble registered student_id=%s random_id=%d visible=%s", student_id, random_id, visible)
+    _advertise_start(BLE_UUID_CONFIRM, _encode_student_id(student_id) + bytes([random_id]))
     GLib.timeout_add(BLE_CONFIRM_DURATION_SECONDS * 1000, _return_to_idle_tick)
 
 
@@ -378,9 +449,9 @@ def _reap_expired_registrations() -> bool:
 
 def _handle_ble_scan_result_from_device(dev) -> None:
     """새로 발견된 BLE 기기(bluezero Device)의 최초 ServiceData를 처리한다."""
-    student_id = _parse_service_data(dev.service_data or {})
-    if student_id is not None:
-        _handle_ble_scan_result(student_id, dev.RSSI or 0)
+    payload = _extract_register_payload(dev.service_data or {})
+    if payload is not None:
+        _handle_ble_register_signal(payload, dev.RSSI or 0)
 
 
 def _on_bluez_properties_changed(interface, changed, invalidated, path) -> None:
@@ -390,9 +461,9 @@ def _on_bluez_properties_changed(interface, changed, invalidated, path) -> None:
     service_data = changed.get("ServiceData")
     if service_data is None:
         return
-    student_id = _parse_service_data(service_data)
-    if student_id is not None:
-        _handle_ble_scan_result(student_id, changed.get("RSSI", 0))
+    payload = _extract_register_payload(service_data)
+    if payload is not None:
+        _handle_ble_register_signal(payload, changed.get("RSSI", 0))
 
 
 def _ble_main() -> None:
