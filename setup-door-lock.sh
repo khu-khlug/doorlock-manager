@@ -6,7 +6,8 @@ set -e
 
 read -rp "Enter room number (3 digits): " ROOM_NUMBER
 
-REPO_RAW="https://raw.githubusercontent.com/khu-khlug/doorlock-manager/main"
+REPO_REF="${DOOR_LOCK_REPO_REF:-main}"
+REPO_RAW="https://raw.githubusercontent.com/khu-khlug/doorlock-manager/${REPO_REF}"
 SETUP_USER="${SUDO_USER:-$(whoami)}"
 SETUP_DIR="$(cd "$(dirname "$0")" && pwd)"
 KIOSK_USER="kiosk"

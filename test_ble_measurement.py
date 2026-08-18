@@ -12,7 +12,7 @@ from pathlib import Path
 
 from ble_measurement import (
     BleMeasurementRecorder,
-    HttpBatchTransport,
+    HttpSyncTransport,
     MeasurementUploader,
     SQLiteMeasurementStore,
 )
@@ -47,6 +47,17 @@ class MeasurementTestCase(unittest.TestCase):
         )
         recorder.start()
         return recorder
+
+    @staticmethod
+    def sync_response(payload, *, desired_version=0, desired_run=None):
+        return {
+            "ackedEventIds": [item["eventId"] for item in payload["observations"]],
+            "ackedRunRevisions": [
+                {"runId": item["runId"], "revision": item["revision"]}
+                for item in payload["runUpdates"]
+            ],
+            "desiredState": {"version": desired_version, "run": desired_run},
+        }
 
     def test_only_one_run_can_be_active(self):
         run_id = self.start_run()
@@ -84,7 +95,7 @@ class MeasurementTestCase(unittest.TestCase):
         self.assertEqual((run_id, expected_tag, -63, "triggered"), row)
         self.assertNotEqual("2026123456", expected_tag)
 
-    def test_outside_run_keeps_only_recent_tag_and_counts_drops(self):
+    def test_outside_run_keeps_raw_observation_with_null_run(self):
         recorder = self.recorder()
         try:
             self.assertTrue(
@@ -110,12 +121,14 @@ class MeasurementTestCase(unittest.TestCase):
             recorder.close()
 
         status = self.store.status()
-        self.assertEqual(1, status["stats"]["outside_run"])
+        self.assertEqual(1, status["stats"]["outside_run_written"])
         self.assertEqual(1, status["stats"]["missing_rssi"])
         self.assertEqual(-71, status["recentObservations"][0]["rssi"])
         with closing(sqlite3.connect(self.database)) as connection:
-            count = connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
-        self.assertEqual(0, count)
+            row = connection.execute(
+                "SELECT run_id, rssi FROM observations"
+            ).fetchone()
+        self.assertEqual((None, -71), row)
 
     def test_export_csv_preserves_raw_observation_fields(self):
         run_id = self.start_run()
@@ -160,15 +173,17 @@ class MeasurementTestCase(unittest.TestCase):
 
         def transport(payload):
             payloads.append(payload)
-            return [payload["observations"][0]["eventId"]]
+            return self.sync_response(payload)
 
         uploader = MeasurementUploader(
             self.store,
             pi_id="pi-test",
+            boot_id="current-boot",
             transport=transport,
         )
         self.assertEqual(1, uploader.upload_once())
-        self.assertEqual(run_id, payloads[0]["runs"][0]["runId"])
+        self.assertEqual(run_id, payloads[0]["runUpdates"][0]["runId"])
+        self.assertEqual(1, payloads[0]["runUpdates"][0]["revision"])
         self.assertEqual("pi-test", payloads[0]["observations"][0]["piId"])
         self.assertIn("bootId", payloads[0]["observations"][0])
         self.assertEqual([], self.store.fetch_unuploaded())
@@ -191,13 +206,18 @@ class MeasurementTestCase(unittest.TestCase):
         uploader = MeasurementUploader(
             self.store,
             pi_id="pi-test",
-            transport=lambda payload: ["unknown-event"],
+            boot_id="current-boot",
+            transport=lambda payload: {
+                "ackedEventIds": ["unknown-event"],
+                "ackedRunRevisions": [],
+                "desiredState": {"version": 0, "run": None},
+            },
         )
         with self.assertRaisesRegex(ValueError, "unknown event"):
             uploader.upload_once()
         self.assertEqual(1, len(self.store.fetch_unuploaded()))
 
-    def test_http_transport_uses_batch_endpoint_and_bearer_token(self):
+    def test_http_transport_uses_sync_endpoint_and_bearer_token(self):
         received = {}
 
         class Handler(BaseHTTPRequestHandler):
@@ -206,7 +226,11 @@ class MeasurementTestCase(unittest.TestCase):
                 received["path"] = self.path
                 received["authorization"] = self.headers["Authorization"]
                 received["body"] = json.loads(self.rfile.read(length))
-                body = json.dumps({"ackedEventIds": ["event-1"]}).encode("utf-8")
+                body = json.dumps({
+                    "ackedEventIds": ["event-1"],
+                    "ackedRunRevisions": [],
+                    "desiredState": {"version": 0, "run": None},
+                }).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -220,21 +244,122 @@ class MeasurementTestCase(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            transport = HttpBatchTransport(
+            transport = HttpSyncTransport(
                 f"http://127.0.0.1:{server.server_port}", "test-token"
             )
-            self.assertEqual(
-                ["event-1"],
-                transport({"observations": [{"eventId": "event-1"}]}),
-            )
+            response = transport({"observations": [{"eventId": "event-1"}]})
+            self.assertEqual(["event-1"], response["ackedEventIds"])
         finally:
             server.shutdown()
             server.server_close()
             thread.join(2)
 
-        self.assertEqual("/api/observations/batch", received["path"])
+        self.assertEqual("/api/v1/pi/sync", received["path"])
         self.assertEqual("Bearer test-token", received["authorization"])
         self.assertEqual("event-1", received["body"]["observations"][0]["eventId"])
+
+    def test_empty_sync_applies_versioned_start_and_stop(self):
+        desired_run = {
+            "runId": "server-run-1",
+            "expectedResult": "deny",
+            "targetDeviceTag": "phone-a",
+            "position": "inside-room",
+            "carrying": "pocket",
+            "bodyOrientation": "back-to-pi",
+            "otherDevices": ["phone-b"],
+            "notes": "server controlled",
+        }
+        payloads = []
+        responses = [
+            {"version": 4, "run": desired_run},
+            {"version": 5, "run": None},
+        ]
+
+        def transport(payload):
+            payloads.append(payload)
+            desired = responses.pop(0)
+            return self.sync_response(
+                payload, desired_version=desired["version"], desired_run=desired["run"]
+            )
+
+        uploader = MeasurementUploader(
+            self.store,
+            pi_id="pi-test",
+            boot_id="current-boot",
+            transport=transport,
+        )
+        self.assertEqual(0, uploader.upload_once())
+        self.assertEqual("server-run-1", self.store.status()["activeRun"]["run_id"])
+        self.assertEqual(4, self.store.status()["appliedDesiredVersion"])
+
+        self.assertEqual(0, uploader.upload_once())
+        self.assertIsNone(self.store.status()["activeRun"])
+        self.assertEqual(5, self.store.status()["appliedDesiredVersion"])
+        self.assertEqual([], payloads[0]["observations"])
+        self.assertEqual("server-run-1", payloads[1]["activeRunId"])
+        self.assertEqual(1, payloads[1]["runUpdates"][0]["revision"])
+
+    def test_same_desired_version_is_not_applied_twice(self):
+        desired = {
+            "version": 1,
+            "run": {
+                "runId": "server-run-1", "expectedResult": "allow",
+                "targetDeviceTag": "phone-a", "position": "outside-0.5m",
+                "carrying": "hand", "bodyOrientation": "facing-pi",
+                "otherDevices": [], "notes": "",
+            },
+        }
+        self.assertTrue(self.store.apply_desired_state(desired))
+        self.assertFalse(self.store.apply_desired_state(desired))
+        self.assertEqual(1, len(self.store.fetch_unacked_run_updates()))
+
+    def test_existing_database_migrates_run_id_to_nullable(self):
+        legacy_database = self.directory / "legacy.sqlite3"
+        with closing(sqlite3.connect(legacy_database)) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE runs (
+                    run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
+                    expected_result TEXT NOT NULL, target_device_tag TEXT NOT NULL,
+                    position TEXT NOT NULL, carrying TEXT NOT NULL,
+                    body_orientation TEXT NOT NULL, other_devices TEXT NOT NULL,
+                    notes TEXT NOT NULL
+                );
+                CREATE TABLE observations (
+                    event_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL,
+                    run_id TEXT NOT NULL REFERENCES runs(run_id), pi_id TEXT NOT NULL,
+                    boot_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                    observed_at TEXT NOT NULL, monotonic_ns INTEGER NOT NULL,
+                    device_tag TEXT NOT NULL, packet_kind TEXT NOT NULL,
+                    service_uuid TEXT NOT NULL, rssi INTEGER NOT NULL,
+                    pi_phase TEXT NOT NULL, uploaded_at TEXT
+                );
+                """
+            )
+        migrated = SQLiteMeasurementStore(str(legacy_database))
+        with closing(sqlite3.connect(legacy_database)) as connection:
+            columns = {
+                row[1]: row[3]
+                for row in connection.execute("PRAGMA table_info(observations)")
+            }
+        self.assertEqual(0, columns["run_id"])
+        self.assertEqual([], migrated.fetch_unuploaded())
+
+    def test_sync_batch_contains_only_one_boot_id(self):
+        with self.store._connection() as connection:
+            for boot_id, sequence in (("old-boot", 1), ("new-boot", 1)):
+                connection.execute(
+                    """INSERT INTO observations (
+                           event_id, schema_version, run_id, pi_id, boot_id, sequence,
+                           observed_at, monotonic_ns, device_tag, packet_kind,
+                           service_uuid, rssi, pi_phase
+                       ) VALUES (?, 1, NULL, 'pi-test', ?, ?, ?, ?, 'tag',
+                                 'register', 'uuid', -60, 'idle')""",
+                    (f"{boot_id}:{sequence}", boot_id, sequence,
+                     f"2026-08-18T00:00:0{sequence}Z", sequence),
+                )
+        first_batch = self.store.fetch_unuploaded(100)
+        self.assertEqual({"old-boot"}, {item["bootId"] for item in first_batch})
 
 
 if __name__ == "__main__":

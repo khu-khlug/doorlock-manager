@@ -202,7 +202,7 @@ def _start_ble_measurement() -> None:
 
     from ble_measurement import (
         BleMeasurementRecorder,
-        HttpBatchTransport,
+        HttpSyncTransport,
         MeasurementUploader,
         SQLiteMeasurementStore,
     )
@@ -226,7 +226,8 @@ def _start_ble_measurement() -> None:
             uploader = MeasurementUploader(
                 store,
                 pi_id=pi_id,
-                transport=HttpBatchTransport(endpoint, token),
+                boot_id=recorder.boot_id,
+                transport=HttpSyncTransport(endpoint, token),
                 logger=logger,
             )
             uploader.start()
