@@ -128,11 +128,11 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
     | `3333` HEARTBEAT_ACK | Pi → 폰 | **정확히 24바이트** 재실 명단 |
 
   - **폰이 보내는 신호는 `1111` 하나뿐이고 payload 길이로 의미가 갈린다** — 21바이트는 등록 요청, 2바이트는 하트비트. 길이로 명확히 구분되며, **하트비트는 항상 즉시 처리한다**(`Ble._on_register_signal`). 이걸 어기면 등록 기기가 30초 뒤 만료되고 재등록하며 **이미 안에 있는 사람에게 문이 다시 열리는 버그**가 생긴다.
-  - **상시 근접 스트림**: 트리거로 수집 윈도우를 열고 닫는 방식이 아니라, Pi는 항상 스캔하며 **1초마다 그 사이 들어온 등록 요청을 배치로 모은다**(같은 폰이 여러 번 보내면 최신 것만 남긴다, `Ble.Registry.add_candidate`/`snapshot_and_clear_candidates`). 그 1초치 후보 목록을 `select_closest_candidate_in_range()`에 넘겨 임계 거리 이내에 있는 후보 중 가장 가까운 것 하나를 고른다 — 범위 안에 아무도 없으면 아무 일도 일어나지 않는다. **거리 계산과 임계값은 목업이다**(현재는 RSSI 최댓값 + 임계값 비교로 임시 구현, `BLE_PROXIMITY_RSSI_THRESHOLD`) — 정확한 알고리즘은 별도로 구현될 예정이다. 선택된 후보에 대해서만 `attempt_unlock` 1회를 호출하고, 성공하면 등록 + 확인 광고를 켠다. 이미 등록된 기기는 후보에서 제외해 재개방을 막는다. 30초 이상 하트비트가 없으면 등록 목록에서 제거한다.
+  - **상시 근접 스트림**: 트리거로 수집 윈도우를 열고 닫는 방식이 아니라, Pi는 항상 스캔하며 **1초마다 그 사이 들어온 등록 요청을 배치로 모은다**(같은 폰이 여러 번 보내면 최신 것만 남긴다, `Ble.Registry.add_candidate`/`snapshot_and_clear_candidates`). 그 1초치 후보 목록을 `select_closest_candidate_in_range()`에 넘겨 임계 거리 이내에 있는 후보 중 가장 가까운 것 하나를 고른다 — 범위 안에 아무도 없으면 아무 일도 일어나지 않는다. **거리 계산과 임계값은 목업이다**(현재는 RSSI 최댓값 + 임계값 비교로 임시 구현, `BLE_PROXIMITY_RSSI_THRESHOLD`) — 정확한 알고리즘은 별도로 구현될 예정이다. 선택된 후보에 대해서만 `attempt_unlock` 1회를 호출하고, 성공하면 등록 + 확인 광고를 켠다. **이미 등록된 기기를 후보에서 제외하는 검사는 후보를 넣을 때가 아니라 꺼낼 때(`Ble.Registry.snapshot_and_clear_candidates`) 한다** — 후보 삽입과 실제 인증 사이에는 최대 1초(배치 주기) + 백엔드 왕복 시간이 있어서, 넣을 때만 검사하면 그 사이에 등록이 끝난 기기가 다음 배치에 남아 재인증된다. 그러면 같은 사람에게 문이 다시 열리고 세션토큰까지 새로 발급되어, 폰이 든 토큰과 재실 명단이 어긋난다. 30초 이상 하트비트가 없으면 등록 목록에서 제거한다.
   - **재실 명단(`3333`)은 항상 정확히 24바이트다.** 등록된 세션토큰을 앞에서부터 채우고 뒤는 `0`으로 패딩한다(`Ble.Payload.roster_payload()`). 앱의 `matchesHeartbeatRoster`가 `payload.size != 24`면 무조건 거부하므로 반드시 지켜야 한다. **정원은 24명이 하드 캡이다** — `Ble.Registry.register()`가 24명이 이미 등록된 상태에서의 새 등록 요청을 그냥 실패시킨다(`attempt_unlock`조차 호출하지 않는다). 그래서 명단을 여러 묶음으로 나눠 순환할 필요가 없다.
   - **세션토큰은 1~255이며 `0`은 발급하지 않는다**(`Ble.Registry._allocate_random_id`). `0`은 앱이 명단의 빈 슬롯으로 해석하는 예약값이라, 0을 주면 그 기기는 명단에서 자기 토큰을 영영 못 찾는다.
   - 학번은 앱의 `BlePayloadCodec.encodeStudentId()`와 동일한 방식(2바이트씩 맞바꾼 뒤 16진수 20자로 인코딩)으로 주고받는다 — `Ble.Payload.decode_student_id()`/`encode_student_id()`가 이 인코딩을 처리한다.
-  - **송출은 광고 인스턴스 3개로 나눠 등록한다**(아래 "BLE 계층별 한계" 참고). 신호마다 요구되는 주기가 다르기 때문이다. **세 인스턴스 모두 기동 시 상시 등록해두고, 운영 중엔 절대 register/unregister를 다시 하지 않는다** — 이벤트 시에만 register하는 방식은 AlreadyExists 영구 교착을 만든 전례가 있어 이번 설계에서 전면 금지했다. "송출 여부"는 등록 여부가 아니라 **내용을 바꾸는 것**으로 조절한다.
+  - **송출은 광고 인스턴스 3개로 나눠 등록한다**(아래 "BLE 계층별 한계" 참고). 신호마다 요구되는 주기가 다르기 때문이다. **세 인스턴스 모두 기동 시 상시 등록해두고, 운영 중엔 절대 register/unregister를 다시 하지 않는다** — 이벤트 시에만 register하는 방식은 AlreadyExists 영구 교착을 만든다. "송출 여부"는 등록 여부가 아니라 **내용을 바꾸는 것**으로 조절한다.
 
     | 인스턴스 | 평소(비활성) | 인증 성공 시 |
     |---|---|---|
@@ -182,7 +182,7 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
 - 백엔드 API 스펙이 블루투스 인증을 위해 바뀌면(새 엔드포인트 또는 기존 엔드포인트의 payload 확장) `Ble._confirm_candidate()`가 `attempt_unlock`에 넘기는 `endpoint`/`payload` 값만 그에 맞게 구성하면 되고, `attempt_unlock`/`request_backend_authorization` 자체는 손댈 필요 없다. 현재는 `/unlock`과 동일한 `/internal/door-lock/accesses` + `{"number", "roomNumber"}`를 그대로 재사용한다는 가정이며, 백엔드팀 확인이 필요하다.
 - **근접 판정은 목업이다.** `select_closest_candidate_in_range()`(모듈 최상위 자유 함수, `Ble` 클래스 밖에 있다 — 알고리즘을 통째로 갈아끼울 사람이 클래스 구조를 몰라도 바로 찾도록)와 임계값 상수 `BLE_PROXIMITY_RSSI_THRESHOLD`는 현재 RSSI 최댓값 + 임계값 비교로 임시 구현돼 있다. 실제 거리 판별 알고리즘으로 교체될 예정이다.
 - **BLE UUID와 payload 규격은 앱이 기준이다.** 앱(`parksiwoo2/doorlock-frontend`) 원격 `main`의 `BleConstants.kt`/`BlePayloadCodec.kt`를 근거로 삼고, 어긋나면 Pi를 고친다. 코드 상수 `Ble.UUID_PRESENCE`/`UUID_REGISTER`/`UUID_CONFIRM`/`UUID_HEARTBEAT_ACK`가 기본값이고, 재배포 없이 바꾸려면 `/etc/door-lock/ble-uuids` 파일을 쓴다(아래 "BLE UUID 설정 파일" 참고). **세션토큰은 `Ble.RANDOM_ID_MIN`(=1)~`Ble.RANDOM_ID_MAX`(=255)이며 `0`은 앱이 명단의 빈 슬롯으로 쓰는 예약값이라 절대 발급하지 않는다.**
-- **재실 명단 payload는 항상 정확히 `Ble.ROSTER_LENGTH`(=24)바이트여야 한다**(`Ble.Payload.roster_payload()`). 앱의 `matchesHeartbeatRoster`가 길이를 엄격히 검사하므로 인원수만큼만 보내면 폰이 통째로 무시한다. **정원(24명)을 넘는 등록 요청은 `Ble.Registry.register()`가 그냥 실패시킨다** — 예전처럼 명단을 여러 묶음으로 나눠 순환하지 않는다. 이 계약들(24바이트 고정, 토큰 0 금지, 정원 초과 시 실패)은 `test_door_lock_daemon.py`가 테스트로 못박고 있다.
+- **재실 명단 payload는 항상 정확히 `Ble.ROSTER_LENGTH`(=24)바이트여야 한다**(`Ble.Payload.roster_payload()`). 앱의 `matchesHeartbeatRoster`가 길이를 엄격히 검사하므로 인원수만큼만 보내면 폰이 통째로 무시한다. **정원(24명)을 넘는 등록 요청은 `Ble.Registry.register()`가 그냥 실패시킨다** — 그래서 명단은 항상 한 묶음이면 충분하다. 이 계약들(24바이트 고정, 토큰 0 금지, 정원 초과 시 실패)은 `test_door_lock_daemon.py`가 테스트로 못박고 있다.
 - 학번은 원문이 아니라 앱과 동일한 인코딩(2바이트씩 맞바꾼 뒤 16진수 20자, `Ble.Payload.decode_student_id`/`encode_student_id`)으로 주고받는다. 등록 요청(21바이트)과 하트비트(2바이트)는 같은 REGISTER UUID로 오지만 payload 길이로 구분한다(`Ble._on_register_signal`). **하트비트는 항상 즉시 처리해야 한다** — 이걸 어기면 이미 안에 있는 사람에게 문이 반복해서 열린다.
 - 근접 스캔(`Ble._proximity_scan_loop`)/만료 정리(`Ble._reap_loop`)는 각각 독립된 `threading.Timer` 체인으로 자기 자신을 재예약한다. 콜백 안에서 예외가 나도 재예약 자체는 계속되도록 각 루프가 자체적으로 try/except를 감싸거나 `_log_callback_exceptions` 데코레이터를 쓴다.
 - **24시간 운용을 전제로 로그를 아낀다.** 수신 신호마다 로그를 남기면 초당 수십 줄이 쌓여 SD 카드 수명과 로그 가독성을 모두 해친다. 후보는 처음 잡혔을 때만 `INFO`로 남기고, 그 외 `INFO`에는 실제 사건(개방·등록·만료·광고 등록/해제·오류)만 남긴다.
@@ -288,4 +288,4 @@ sudo btmgmt advinfo     # Secondary Channel 항목이 있으면 동시 광고 �
 dmesg | grep -i blue    # Frame reassembly failed 가 없어야 정상
 ```
 
-`setup-door-lock.sh`의 BLE 의존성은 `bluez`/`python3-dbus`/`python3-gi`면 충분하다(`bluezero`는 더 이상 쓰지 않는다). 데몬은 CLI 인자 없이 항상 상시 근접 스트림으로 동작한다 — 테스트 시엔 `setup-door-lock-test.sh`로 셋업하고 수동 실행한다.
+`setup-door-lock.sh`의 BLE 의존성은 `bluez`/`python3-dbus`/`python3-gi`면 충분하다(BLE는 BlueZ D-Bus API를 직접 쓰므로 `bluezero`가 필요 없다). 데몬은 CLI 인자 없이 항상 상시 근접 스트림으로 동작한다 — 테스트 시엔 `setup-door-lock-test.sh`로 셋업하고 수동 실행한다.

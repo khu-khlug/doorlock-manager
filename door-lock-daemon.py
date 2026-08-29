@@ -233,7 +233,7 @@ class Ble:
     # 상태를 반복 확인하는 폴링이 아니라, 재시작 직후 한 번만 쉬는 고정 지연이다.
     SERVICE_RESTART_SETTLE_SECONDS = 3
 
-    # BlueZ D-Bus 이름들. bluezero를 걷어냈으므로 직접 정의한다.
+    # BlueZ D-Bus 이름들. BlueZ D-Bus API를 직접 쓰므로 여기서 정의한다.
     BLUEZ_SERVICE = "org.bluez"
     ADAPTER_IFACE = "org.bluez.Adapter1"
     DEVICE_IFACE = "org.bluez.Device1"
@@ -375,14 +375,15 @@ class Ble:
 
         def add_candidate(self, student_id: str, rssi: int, visible: bool) -> None:
             """1초 배치 윈도우에 등록 후보를 쌓는다. 같은 폰이 여러 번 보내면 최신 것으로
-            덮어쓴다. 이미 등록된 기기는 (하트비트를 못 받아) 등록 요청을 다시 보내는
-            경우가 있는데, 새 후보로 받아들이면 재인증·재개방이 일어나므로 제외한다."""
+            덮어쓴다.
+
+            이미 등록된 기기인지는 여기서 거르지 않고 꺼낼 때 거른다
+            (snapshot_and_clear_candidates 참고) — 이유는 그쪽 주석에 있다."""
             with self._lock:
-                if student_id in self._registered_devices:
-                    return
-                if student_id not in self._candidates:
+                if student_id not in self._candidates and student_id not in self._registered_devices:
                     # 폰은 초당 여러 번 같은 신호를 보낸다. 매번 찍으면 24시간 운용에서
-                    # 로그가 폭주하니 처음 한 번만 남긴다.
+                    # 로그가 폭주하니 처음 한 번만 남긴다. 등록을 마친 기기가 확인 광고를
+                    # 놓쳐 등록 요청을 계속 보내는 경우도 로그에서 제외한다.
                     logger.info("ble candidate added student_id=%s rssi=%d visible=%s", student_id, rssi, visible)
                 self._candidates[student_id] = {
                     "student_id": student_id,
@@ -392,9 +393,22 @@ class Ble:
                 }
 
         def snapshot_and_clear_candidates(self) -> list:
-            """직전 1초 동안 쌓인 후보를 꺼내고 비운다."""
+            """직전 1초 동안 쌓인 후보를 꺼내고 비운다. **이미 등록된 기기는 여기서 제외한다.**
+
+            거르는 시점이 꺼낼 때인 이유: 후보로 들어간 뒤 실제로 인증되기까지 최대 1초(배치
+            주기) + 백엔드 왕복 시간이 걸린다. 넣을 때만 검사하면 그 사이에 등록이 끝난 기기가
+            다음 배치에 그대로 남아 재인증되고, 문이 다시 열리면서 세션토큰까지 새로 발급된다
+            (폰은 먼저 받은 토큰을 들고 있는데 재실 명단에는 새 토큰이 실려 서로 어긋난다).
+            꺼내는 시점에 확인하면 등록 직후의 잔여 후보가 전부 걸러진다.
+
+            _registered_devices와 _candidates를 같은 락 안에서 함께 보므로, register()가
+            중간에 끼어들어 생기는 경합은 없다.
+            """
             with self._lock:
-                candidates = list(self._candidates.values())
+                candidates = [
+                    info for student_id, info in self._candidates.items()
+                    if student_id not in self._registered_devices
+                ]
                 self._candidates.clear()
             return candidates
 
@@ -423,8 +437,8 @@ class Ble:
 
         def register(self, student_id: str, visible: bool) -> Optional[int]:
             """정원(Ble.ROSTER_LENGTH명) 안에서만 세션토큰을 발급하고 등록한다.
-            꽉 차 있으면 아무것도 하지 않고 None을 반환한다 — 24명 넘으면 등록 자체를
-            실패로 처리하고, 예전처럼 명단을 여러 묶음으로 나눠 순환하지 않는다."""
+            꽉 차 있으면 아무것도 하지 않고 None을 반환한다 — 정원을 넘는 등록은 실패로
+            처리한다. 그래서 명단 payload는 항상 한 묶음이면 충분하다."""
             with self._lock:
                 if len(self._registered_devices) >= Ble.ROSTER_LENGTH:
                     return None
@@ -470,7 +484,7 @@ class Ble:
             self.roster_ad = None    # 3333, 기동 시 등록 후 상시 유지. 등록 목록이 바뀔 때 payload만 갱신
             self.confirm_ad = None   # 2222, 이것도 기동 시 등록 후 상시 유지. 평소엔 비활성값을 내보내다가
                                       # 인증 성공 시에만 실제 내용 + Duration을 잠깐 키운다(런타임
-                                      # register/unregister는 이번 설계에서 금지 — show_confirm 참고)
+                                      # register/unregister는 하지 않는다 — show_confirm 참고)
             self.ad_manager_methods = None  # org.bluez.LEAdvertisingManager1 인터페이스 (등록/해제 전용)
 
         @staticmethod
@@ -627,9 +641,9 @@ class Ble:
             )
             self.roster_ad.set_payload(Ble.Payload.roster_payload([]))
 
-            # 확인: 이것도 기동 시 상시 등록한다 — 인증 성공 시에만 register/unregister하는
-            # 방식은 우리가 이번 재설계에서 금지한 바로 그 패턴이다(런타임 등록/해제가
-            # AlreadyExists 영구 교착을 만든 전례가 있다). 대신 평소엔 비활성값(전부 0)을
+            # 확인: 이것도 기동 시 상시 등록한다 — 인증 성공 시에만 register/unregister하면
+            # 런타임 등록/해제가 AlreadyExists 영구 교착을 만든다(register_persistent 주석
+            # 참고). 그래서 등록은 기동 시 한 번뿐이고, 평소엔 비활성값(전부 0)을
             # 싣고, 인증 성공 시에만 잠깐 실제 값으로 갈아끼운다 — 인코딩 학번은 항상
             # ASCII 16진수 문자('0'-'9','A'-'F')라 전부 0인 바이트는 어떤 실제 학번과도
             # 절대 일치하지 않으므로, 이 값이 곧 "아무 신호도 없음"과 동등하다.
@@ -688,9 +702,11 @@ class Ble:
         def register_persistent(self) -> None:
             """세 인스턴스(트리거·명단·확인)를 전부 등록한다. 프로세스당 한 번만 호출한다.
 
-            확인 인스턴스도 여기서 함께 등록한다 — 인증 이벤트가 날 때만 register/unregister를
-            반복하는 방식은 쓰지 않는다(런타임 등록/해제가 AlreadyExists 영구 교착을 만든 전례가
-            있다). 세 인스턴스 모두 기동 시 한 번 등록해두고, 이후엔 내용만 갈아끼운다.
+            확인 인스턴스도 여기서 함께 등록한다 — 인증 이벤트마다 register/unregister를
+            반복하면 AlreadyExists 영구 교착에 빠진다(RegisterAdvertisement가 NoReply로 끝나도
+            bluetoothd 큐에는 클라이언트가 남아, 같은 (owner, path) 재시도가 전부 거부된다 —
+            _register_one 주석 참고). 세 인스턴스 모두 기동 시 한 번 등록해두고, 이후엔
+            내용만 갈아끼운다.
 
             등록 전에 같은 경로를 먼저 해제해둔다. BlueZ는 소유자(D-Bus 발신자 이름)가 다르면
             남의 광고를 건드리지 못하게 막으므로(advertising.c:1727) 이전 프로세스가 남긴 것은
@@ -751,16 +767,12 @@ class Ble:
         def prepare(self) -> None:
             """블루투스 어댑터를 능동적으로 살려서 항상 깨끗한 상태에서 시작한다.
 
-            실기에서 확인된 실패( Powered 설정이 org.bluez.Error.Failed로 거부, 이어서
-            SetDiscoveryFilter가 NotReady로 실패 )는 처음엔 bluetoothd 내부 mgmt 연결이
-            깨진 것으로 의심했지만(BlueZ 5.82 src/adapter.c의 property_set_mode() — mgmt_send()가
-            큐잉에 실패하면 커널 응답도 기다리지 않고 곧장 ERROR_INTERFACE ".Failed"를 반환하는
-            분기), bluetooth.service를 재시작해도 재현돼 그 가설은 반증됐다.
-
-            실제 원인은 **rfkill 소프트 블록**이었다 — `rfkill list`에서 hci0이
-            `Soft blocked: yes`, `hciconfig -a`에서 `hci0`이 `DOWN`으로 확인됐다. rfkill이
-            막고 있으면 bluetoothd가 몇 번을 재시작해도 그 아래 인터페이스를 못 올리므로,
-            Powered를 시도하기 전에 반드시 rfkill부터 풀어야 한다.
+            **rfkill 소프트 블록**이 걸려 있으면 Powered 설정이 org.bluez.Error.Failed로
+            거부되고, 이어지는 SetDiscoveryFilter도 org.bluez.Error.NotReady로 실패해 BLE
+            스레드가 통째로 죽는다. 실기(Pi 4)에서 `rfkill list`의 hci0이 `Soft blocked: yes`,
+            `hciconfig -a`의 hci0이 `DOWN`인 상태로 확인된 조합이다. rfkill이 막고 있으면
+            bluetoothd를 몇 번 재시작해도 그 아래 인터페이스를 못 올리므로, Powered를
+            시도하기 전에 반드시 rfkill부터 풀어야 한다.
 
             블루투스는 이 데몬 전용이라 재시작·언블록해도 방해받는 다른 프로세스가 없다.
             그래서 "상태를 확인하고 필요하면 조치"가 아니라 **매 기동마다 무조건** rfkill을
@@ -815,7 +827,7 @@ class Ble:
 
         def connect(self):
             """D-Bus GLib 메인루프를 설정하고 어댑터를 켠 뒤 (bus, adapter_path, adapter_object)를
-            반환한다. 광고/스캔 모두 bluezero 없이 BlueZ D-Bus API를 직접 쓴다."""
+            반환한다."""
             import dbus
             import dbus.mainloop.glib
 
@@ -1022,7 +1034,7 @@ class Ble:
     def start_logged(self) -> None:
         """start()를 감싸 예외를 daemon.log에 남긴다. 이게 없으면 BLE 스레드가 죽어도
         stderr에만 트레이스백이 찍히고 로그 파일엔 아무 것도 안 남아, 겉보기엔 데몬이
-        멀쩡한데 BLE만 조용히 멈춘 상태가 된다 (실기에서 그렇게 한참 헤맸다)."""
+        멀쩡한데 BLE만 조용히 멈춘 상태가 되어 진단이 불가능해진다."""
         self.start()
 
     def shutdown(self, *_args) -> None:
@@ -1031,10 +1043,9 @@ class Ble:
         SIGTERM은 이 모듈이 등록한 핸들러(_handle_shutdown_signal)가 SystemExit을
         던져서 atexit이 정상적으로 실행되지만, SIGKILL(kill -9)은 파이썬이 정리할
         틈도 없이 즉시 죽어서 이 메서드가 아예 호출되지 않는다 — 그러면 bluetoothd의
-        자동 정리(D-Bus 연결 끊김 감지)에만 의존하게 되는데, 실기에서 이게 항상
-        즉시/확실히 되는 건 아닌 것으로 보였다(다음 프로세스가 뜰 때 "Already Exists"로
-        계속 실패하는 원인 중 하나였다). 그래서 테스트 시 데몬을 죽일 땐 -9 없이
-        pkill/일반 kill(SIGTERM)을 써야 이 정리 로직이 실행된다."""
+        자동 정리(D-Bus 연결 끊김 감지)에만 의존하게 되는데, 이게 항상 즉시 이뤄지지는
+        않아 다음 프로세스가 뜰 때 광고 등록이 "Already Exists"로 실패할 수 있다.
+        그래서 테스트 시 데몬을 죽일 땐 -9 없이 pkill/일반 kill(SIGTERM)을 써야 한다."""
         self.advertising.unregister_all()
 
 
