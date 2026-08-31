@@ -1135,21 +1135,34 @@ class Ble:
 
 Ble._load_uuids_from_file()
 
-# 근접 판정 임계값. 판별 알고리즘을 갈아끼우는 자리라 Ble 클래스 상수로 두지 않고
-# 모듈 최상위에 둔다 — 클래스 구조를 몰라도 바로 찾아 고칠 수 있어야 한다.
-BLE_PROXIMITY_RSSI_THRESHOLD = -60  # dBm
+# 실측 전에는 기존 동작과 같은 RSSI 점수를 사용한다. 환경별 측정 결과가 모이면
+# estimate_proximity_score() 내부를 교체한다.
+BLE_PROXIMITY_SCORE_THRESHOLD = -60
+
+
+def estimate_proximity_score(candidate: dict) -> int:
+    """후보의 근접도 점수를 반환한다. 점수가 클수록 가까운 것으로 판정한다.
+
+    현재는 기존 목업 동작을 보존하기 위해 RSSI를 그대로 사용한다. 실측 후에는
+    주머니·차폐·실내 위치 등 환경 변수를 고려한 판정으로 이 함수만 교체한다.
+    """
+    return candidate["rssi"]
 
 
 def select_closest_candidate_in_range(candidates: list) -> Optional[dict]:
-    """1초간 모인 후보 중 임계 거리(신호 세기) 이내에서 가장 가까운 것 하나를 고른다.
-    범위 안에 아무도 없으면 None.
+    """문 앞 범위 안의 후보 중 근접도 점수가 가장 높은 후보를 반환한다."""
+    closest_candidate = None
+    closest_score = None
 
-    RSSI가 BLE_PROXIMITY_RSSI_THRESHOLD 이상인 후보만 남기고 그중 최댓값을 고른다.
-    """
-    in_range = [c for c in candidates if c["rssi"] >= BLE_PROXIMITY_RSSI_THRESHOLD]
-    if not in_range:
-        return None
-    return max(in_range, key=lambda c: c["rssi"])
+    for candidate in candidates:
+        score = estimate_proximity_score(candidate)
+        if score < BLE_PROXIMITY_SCORE_THRESHOLD:
+            continue
+        if closest_score is None or score > closest_score:
+            closest_candidate = candidate
+            closest_score = score
+
+    return closest_candidate
 
 
 _ble = Ble()

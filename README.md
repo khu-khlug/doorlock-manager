@@ -250,9 +250,12 @@ Ble (상수 + 인스턴스 보유 + 조정 로직)
 `self.advertising.refresh_roster()`/`show_confirm()` 순서로 여러 클래스를 조정하는데, 이런 흐름은
 `Registry`나 `Advertising` 어느 한쪽에 넣으면 그 클래스가 상대방을 알아야 해서 결합이 생긴다.
 
-`select_closest_candidate_in_range()`(근접 판정)와 그 임계값 상수는 의도적으로 `Ble` 밖의
-모듈 최상위에 둔다 — 판별 알고리즘을 갈아끼우는 자리라, 클래스 구조를 몰라도 바로 찾아
-고칠 수 있어야 하기 때문이다.
+`estimate_proximity_score()`와 `select_closest_candidate_in_range()`는 판별 알고리즘을
+갈아끼울 수 있도록 `Ble` 밖의 모듈 최상위 순수 함수로 둔다. selector는 모든 후보에
+근접도 함수를 적용하고, 문 앞 범위 안에서 점수가 가장 높은 하나를 고르며, 범위 안에
+후보가 없으면 `None`을 반환한다. 실측 전에는 기존과 동일하게 RSSI 자체를 근접도 점수로
+사용하고 `-60 dBm`을 범위 기준으로 둔다. 환경별 측정 결과가 생기면 근접도 함수 내부를
+교체한다.
 
 #### BLE UUID 설정 파일
 
