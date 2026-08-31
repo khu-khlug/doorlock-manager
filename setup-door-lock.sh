@@ -33,6 +33,7 @@ sudo apt-get install -y \
     python3-dbus \
     python3-gi \
     bluez \
+    rfkill \
     fonts-nanum
 
 sudo tee /etc/fonts/conf.d/99-nanum-default.conf > /dev/null << 'EOF'

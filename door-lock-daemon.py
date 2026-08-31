@@ -196,9 +196,15 @@ class Ble:
 
     # 재실 명단(HEARTBEAT_ACK) payload는 **정확히 24바이트 고정**이다. 앱의
     # matchesHeartbeatRoster가 payload.size != 24면 무조건 거부하므로 반드시 지켜야 한다.
-    # 등록된 토큰을 앞에서부터 채우고 남는 뒤쪽은 0으로 패딩한다. 정원(24명)을 넘는 등록
-    # 요청은 애초에 Registry.register()가 거부하므로, 여기서 묶음을 나눌 필요가 없다.
-    ROSTER_LENGTH = 24
+    # 등록된 토큰을 앞에서부터 채우고 남는 뒤쪽은 0으로 패딩한다.
+    ROSTER_PAYLOAD_BYTES = 24
+
+    # 동시에 등록할 수 있는 인원. 토큰 하나가 payload 1바이트를 쓰므로 상한은 위 길이와
+    # 같지만, **둘은 별개의 값이다** — 이건 우리 정책이고 위는 앱이 강제하는 전송 규격이다.
+    # 정원을 낮춰 시험할 때 이 값만 건드려야 한다. 위 길이를 낮추면 명단 payload가 24바이트가
+    # 아니게 되어 앱이 명단을 통째로 거부하고, 폰이 자기 등록 상태를 확인하지 못해 세션을
+    # 끊었다가 재등록하면서 문이 주기적으로 다시 열린다.
+    ROSTER_CAPACITY = ROSTER_PAYLOAD_BYTES
 
     # 광고 1건의 ServiceData 상한. legacy 광고 31바이트에서 ServiceData AD 헤더
     # 4바이트(길이+타입+16비트 UUID)를 빼고, BlueZ가 Flags AD(3바이트)를 붙일 여지까지 감안한 값.
@@ -347,13 +353,13 @@ class Ble:
         def roster_payload(random_ids: list) -> bytes:
             """재실 명단(HEARTBEAT_ACK) payload를 만든다.
 
-            **항상 정확히 Ble.ROSTER_LENGTH 바이트**여야 한다 — 앱의 matchesHeartbeatRoster가
+            **항상 정확히 Ble.ROSTER_PAYLOAD_BYTES 바이트**여야 한다 — 앱의 matchesHeartbeatRoster가
             payload.size != 24면 무조건 거부한다. 등록된 세션토큰을 앞에서부터 채우고 남는
             뒤쪽은 0으로 패딩한다(0은 앱이 빈 슬롯으로 해석하는 예약값). Registry.register()가
             정원(24명) 초과 등록을 애초에 거부하므로, random_ids는 항상 이 길이 이하로 들어온다.
             """
             ordered = sorted(random_ids)
-            return bytes(ordered) + bytes(Ble.ROSTER_LENGTH - len(ordered))
+            return bytes(ordered) + bytes(Ble.ROSTER_PAYLOAD_BYTES - len(ordered))
 
     class Registry:
         """재실 테이블 · 후보 · 세션토큰 발급. Ble 상수만 참조하고 Advertising/Adapter는 모른다."""
@@ -435,12 +441,26 @@ class Ble:
             self._random_id_counter = next_id
             return issued
 
-        def register(self, student_id: str, visible: bool) -> Optional[int]:
-            """정원(Ble.ROSTER_LENGTH명) 안에서만 세션토큰을 발급하고 등록한다.
-            꽉 차 있으면 아무것도 하지 않고 None을 반환한다 — 정원을 넘는 등록은 실패로
-            처리한다. 그래서 명단 payload는 항상 한 묶음이면 충분하다."""
+        def has_capacity(self) -> bool:
+            """정원(Ble.ROSTER_CAPACITY명)에 자리가 남았는지 알려준다.
+
+            **인증을 시도하기 전에 이걸로 먼저 걸러야 한다.** 백엔드 인증에 성공하면 그
+            안에서 곧바로 문이 열리므로, 등록 단계에서야 정원 초과를 발견하면 문은 이미
+            열린 뒤다. 그러면 정원이 찼는데도 문만 열리고 세션토큰·명단 등록·확인 광고는
+            전부 실패하는 상태가 되고, 등록이 안 됐으니 그 폰은 다음 배치에서도 다시
+            후보로 뽑혀 매초 문이 열린다."""
             with self._lock:
-                if len(self._registered_devices) >= Ble.ROSTER_LENGTH:
+                return len(self._registered_devices) < Ble.ROSTER_CAPACITY
+
+        def register(self, student_id: str, visible: bool) -> Optional[int]:
+            """정원(Ble.ROSTER_CAPACITY명) 안에서만 세션토큰을 발급하고 등록한다.
+            꽉 차 있으면 아무것도 하지 않고 None을 반환한다 — 정원을 넘는 등록은 실패로
+            처리한다. 그래서 명단 payload는 항상 한 묶음이면 충분하다.
+
+            호출자가 has_capacity()로 미리 걸러도 이 검사는 남겨둔다 — 등록 성립 여부는
+            이 메서드 단독으로 보장돼야 한다."""
+            with self._lock:
+                if len(self._registered_devices) >= Ble.ROSTER_CAPACITY:
                     return None
                 random_id = self._allocate_random_id()
                 self._registered_devices[student_id] = {
@@ -579,6 +599,39 @@ class Ble:
                             return False
                         self._props["Duration"] = dbus.UInt16(seconds)
                         changed = dbus.Dictionary({"Duration": self._props["Duration"]}, signature="sv")
+                    self.PropertiesChanged(
+                        Ble.LE_ADVERTISEMENT_IFACE, changed, dbus.Array([], signature="s")
+                    )
+                    return True
+
+                def set_service_uuids_visible(self, visible: bool) -> bool:
+                    """이 인스턴스의 Service UUID 목록 AD를 실었다 뺐다 한다.
+                    값이 이미 그 상태면 아무 것도 하지 않는다.
+
+                    앱은 트리거 광고를 Service UUID 목록으로 거르므로, 이 목록을 비우면
+                    광고 등록을 유지한 채로 폰의 스캔 필터에 안 걸리게 만들 수 있다.
+                    ServiceData만 비워서는 앱 필터가 그대로 통과하므로 소용이 없다.
+
+                    bluetoothd는 ServiceData와 마찬가지로 ServiceUUIDs 변경도 감시하다가
+                    같은 인스턴스 번호로 광고 데이터를 다시 밀어넣는다. 런타임
+                    register/unregister를 쓰지 않고도 송출을 껐다 켤 수 있는 이유다."""
+                    with self._lock:
+                        already = "ServiceUUIDs" in self._props
+                        if already == visible:
+                            return False
+                        if visible:
+                            self._props["ServiceUUIDs"] = dbus.Array(
+                                [self._uuid_str], signature="s"
+                            )
+                        else:
+                            self._props["ServiceUUIDs"] = dbus.Array([], signature="s")
+                        changed = dbus.Dictionary(
+                            {"ServiceUUIDs": self._props["ServiceUUIDs"]}, signature="sv"
+                        )
+                        if not visible:
+                            # 다음 호출에서 "빠져 있음"으로 판정되도록 키 자체를 지운다.
+                            # 신호에는 빈 배열을 실어 bluetoothd가 목록을 비우게 한다.
+                            del self._props["ServiceUUIDs"]
                     self.PropertiesChanged(
                         Ble.LE_ADVERTISEMENT_IFACE, changed, dbus.Array([], signature="s")
                     )
@@ -725,6 +778,22 @@ class Ble:
             if self.roster_ad is None:
                 return
             self.roster_ad.set_payload(Ble.Payload.roster_payload(tokens))
+
+        def set_presence_enabled(self, enabled: bool) -> None:
+            """트리거(PRESENCE) 광고가 폰에 잡히게 할지 말지를 정한다.
+
+            정원이 차면 끄고, 자리가 나면 다시 켠다. 폰이 애초에 진입 신호를 못 보게 해서
+            들어올 수 없는 상태에서 등록 요청을 반복하는 걸 막는다.
+
+            **광고를 해제하지 않고 Service UUID 목록만 비운다.** 런타임 해제 후 재등록은
+            등록이 한 번만 어긋나도 영구 교착에 빠지는 경로라 쓰지 않는다.
+
+            이미 등록을 마친 사람들에게는 영향이 없다 — 앱은 진입 감시 단계에서만 이 신호를
+            보고, 등록 뒤에는 재실 명단 쪽만 본다."""
+            if self.trigger_ad is None:
+                return
+            if self.trigger_ad.set_service_uuids_visible(enabled):
+                logger.info("ble presence advertisement %s", "enabled" if enabled else "disabled (roster full)")
 
         def show_confirm(self, student_id: str, random_id: int) -> None:
             """등록 확인(2222) 내용을 Ble.CONFIRM_CONTENT_SECONDS 동안만 실제 값으로 보여준다.
@@ -958,9 +1027,13 @@ class Ble:
         최초 1회 이후 반복 실행되지 않는 것으로 실기에서 확인됐다 (README 참고)."""
         try:
             candidates = self.registry.snapshot_and_clear_candidates()
-            candidate = select_closest_candidate_in_range(candidates)
-            if candidate is not None:
-                self._confirm_candidate(candidate)
+            # 정원이 찼으면 후보를 비우기만 하고 판정도 인증도 하지 않는다. 정원이 찬 동안엔
+            # 0312를 안 내보내므로 후보가 새로 쌓일 일도 거의 없지만, 정원이 차기 직전에
+            # 들어온 신호가 남아 있을 수 있다.
+            if self.registry.has_capacity():
+                candidate = select_closest_candidate_in_range(candidates)
+                if candidate is not None:
+                    self._confirm_candidate(candidate)
         except Exception:
             logger.exception("ble proximity scan error")
         t = threading.Timer(Ble.PROXIMITY_SCAN_INTERVAL_SECONDS, self._proximity_scan_loop)
@@ -968,9 +1041,16 @@ class Ble:
         t.start()
 
     def _confirm_candidate(self, candidate: dict) -> None:
-        """선택된 후보 1명의 학번으로 백엔드에 인증을 시도한다 (성공하면 attempt_unlock 내부에서 문이 열린다).
-        인증에 성공하고 정원이 남아 있는 경우에만 세션토큰을 발급해 등록하고 확인 광고를 켠다."""
+        """선택된 후보 1명을 인증하고, 성공하면 등록 + 확인 광고까지 처리한다.
+
+        **정원 확인이 인증보다 먼저다.** attempt_unlock은 백엔드 인증이 통과하는 즉시 문을
+        열기 때문에, 자리가 없는데 인증부터 하면 문만 열리고 등록은 실패하는 상태가 된다.
+        정원이 찬 동안에는 블루투스 인증 자체가 성립하지 않으며, 그때는 키패드로 출입한다."""
         student_id = candidate["student_id"]
+        if not self.registry.has_capacity():
+            logger.info("ble registration rejected (roster full) student_id=%s", student_id)
+            return
+
         result = attempt_unlock(
             "/internal/door-lock/accesses",
             {"number": int(student_id), "roomNumber": ROOM_NUMBER},
@@ -989,6 +1069,8 @@ class Ble:
         # 명단에 새 토큰을 반영하고, 확인 채널 내용을 잠깐 실제 값으로 보여준다.
         # (확인 인스턴스는 기동 시부터 항상 등록돼 있으므로 여기서 register하지 않는다.)
         self.advertising.refresh_roster(self.registry.roster_tokens())
+        # 이번 등록으로 정원이 찼으면 진입 신호를 끊는다.
+        self.advertising.set_presence_enabled(self.registry.has_capacity())
         self.registry.log_table()
         self.advertising.show_confirm(student_id, random_id)
 
@@ -999,6 +1081,8 @@ class Ble:
             expired = self.registry.reap_expired()
             if expired:
                 self.advertising.refresh_roster(self.registry.roster_tokens())
+                # 자리가 났으면 진입 신호를 다시 내보낸다.
+                self.advertising.set_presence_enabled(self.registry.has_capacity())
                 self.registry.log_table()
         except Exception:
             logger.exception("ble reap error")
@@ -1051,18 +1135,16 @@ class Ble:
 
 Ble._load_uuids_from_file()
 
-# 팀원이 실제 거리 판별 알고리즘으로 교체할 자리. 목업이라 RSSI 최댓값 + 임계값
-# 비교로 임시 구현한다. Ble 클래스 상수로 두지 않은 이유는 UUID 설정과 달리 이건
-# 알고리즘 자체가 교체될 값이라, 클래스 구조를 몰라도 바로 찾아 고칠 수 있게 하기 위함.
-BLE_PROXIMITY_RSSI_THRESHOLD = -60  # dBm. TODO: 실측 후 조정, 또는 거리 계산식으로 대체.
+# 근접 판정 임계값. 판별 알고리즘을 갈아끼우는 자리라 Ble 클래스 상수로 두지 않고
+# 모듈 최상위에 둔다 — 클래스 구조를 몰라도 바로 찾아 고칠 수 있어야 한다.
+BLE_PROXIMITY_RSSI_THRESHOLD = -60  # dBm
 
 
 def select_closest_candidate_in_range(candidates: list) -> Optional[dict]:
     """1초간 모인 후보 중 임계 거리(신호 세기) 이내에서 가장 가까운 것 하나를 고른다.
     범위 안에 아무도 없으면 None.
 
-    TODO: 정확한 거리 판별 알고리즘은 아직 미정 — 현재는 RSSI 임계값 통과 + 최댓값
-    비교로 임시 구현했다. 다른 팀원이 실제 알고리즘으로 교체할 예정이다.
+    RSSI가 BLE_PROXIMITY_RSSI_THRESHOLD 이상인 후보만 남기고 그중 최댓값을 고른다.
     """
     in_range = [c for c in candidates if c["rssi"] >= BLE_PROXIMITY_RSSI_THRESHOLD]
     if not in_range:
