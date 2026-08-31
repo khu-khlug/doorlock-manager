@@ -18,7 +18,7 @@ PWA_URL="${PWA_ORIGIN}/door-lock"
 BACKEND_URL="https://api-v2.khlug.org"
 
 # ── 1. Install system packages ────────────────────────────────────────────────
-echo "[1/11] Installing system packages..."
+echo "[1/13] Installing system packages..."
 sudo apt-get update -qq
 sudo apt-get install -y \
     xserver-xorg \
@@ -30,6 +30,10 @@ sudo apt-get install -y \
     python3-flask \
     python3-gpiozero \
     python3-requests \
+    python3-dbus \
+    python3-gi \
+    bluez \
+    rfkill \
     fonts-nanum
 
 sudo tee /etc/fonts/conf.d/99-nanum-default.conf > /dev/null << 'EOF'
@@ -47,7 +51,7 @@ EOF
 sudo fc-cache -f
 
 # ── 2. User and group setup ───────────────────────────────────────────────────
-echo "[2/11] Setting up users and groups..."
+echo "[2/13] Setting up users and groups..."
 
 if ! getent group "$DOOR_LOCK_GROUP" > /dev/null; then
     sudo groupadd "$DOOR_LOCK_GROUP"
@@ -87,12 +91,12 @@ else
     echo "  User already exists: ${DAEMON_SVC_USER}"
 fi
 
-for grp in gpio "$DOOR_LOCK_GROUP"; do
+for grp in gpio bluetooth "$DOOR_LOCK_GROUP"; do
     if getent group "$grp" > /dev/null; then
         sudo usermod -aG "$grp" "$DAEMON_SVC_USER"
     fi
 done
-echo "  ${DAEMON_SVC_USER}: added to gpio, ${DOOR_LOCK_GROUP} groups"
+echo "  ${DAEMON_SVC_USER}: added to gpio, bluetooth, ${DOOR_LOCK_GROUP} groups"
 
 if ! groups "$SETUP_USER" | grep -q "\b${DOOR_LOCK_GROUP}\b"; then
     sudo usermod -aG "$DOOR_LOCK_GROUP" "$SETUP_USER"
@@ -102,7 +106,7 @@ else
 fi
 
 # ── 3. Download scripts ───────────────────────────────────────────────────────
-echo "[3/11] Downloading scripts..."
+echo "[3/13] Downloading scripts..."
 
 for file in setup-door-lock.sh start-door-lock.sh stop-door-lock.sh door-lock-daemon.py README.md; do
     sudo rm -f "${KIOSK_HOME}/${file}"
@@ -119,7 +123,7 @@ sudo chmod 770 "${KIOSK_HOME}/door-lock-daemon.py"
 sudo chmod 660 "${KIOSK_HOME}/README.md"
 
 # ── 4. API key setup ──────────────────────────────────────────────────────────
-echo "[4/11] Setting up API key..."
+echo "[4/13] Setting up API key..."
 
 KEY_SRC="${SETUP_DIR}/internal-api-key"
 API_KEY_DIR="/etc/door-lock"
@@ -146,8 +150,29 @@ echo "  !! Set the backend INTERNAL_API_KEY env var to:"
 echo "     $(cat "$KEY_SRC")"
 echo ""
 
-# ── 5. PWA install policy ─────────────────────────────────────────────────────
-echo "[5/11] Configuring PWA install policy..."
+# ── 5. BLE UUID config ────────────────────────────────────────────────────────
+echo "[5/13] Setting up BLE UUID config..."
+
+BLE_UUID_FILE="${API_KEY_DIR}/ble-uuids"
+if [ ! -f "$BLE_UUID_FILE" ]; then
+    sudo tee "$BLE_UUID_FILE" > /dev/null << 'EOF'
+# BLE UUID 설정. 값을 바꾸면 데몬 재시작 후 즉시 적용된다. 16진수로 적는다("0x" 접두사 불필요).
+# 값의 기준은 앱(parksiwoo2/doorlock-frontend)의 BleConstants.kt다.
+presence=0312
+register=1111
+confirm=2222
+heartbeat_ack=3333
+EOF
+    sudo chown root:"$DAEMON_SVC_USER" "$BLE_UUID_FILE"
+    sudo chmod 640 "$BLE_UUID_FILE"
+    echo "  BLE UUID config created: ${BLE_UUID_FILE}"
+    echo "  (앱과 UUID가 다르면 이 파일을 수정하고 데몬을 재시작하세요)"
+else
+    echo "  BLE UUID config already exists: ${BLE_UUID_FILE}, skipping"
+fi
+
+# ── 6. PWA install policy ─────────────────────────────────────────────────────
+echo "[6/13] Configuring PWA install policy..."
 sudo rm -rf "${KIOSK_HOME}/.config/chromium"
 echo "  Chromium profile reset (PWA cache and local storage cleared)"
 sudo mkdir -p /etc/chromium/policies/managed
@@ -171,8 +196,8 @@ sudo tee /etc/chromium/policies/managed/pwa_install.json > /dev/null << EOF
 }
 EOF
 
-# ── 6. Auto-login setup ───────────────────────────────────────────────────────
-echo "[6/11] Configuring auto-login..."
+# ── 7. Auto-login setup ───────────────────────────────────────────────────────
+echo "[7/13] Configuring auto-login..."
 GETTY_CONF="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 sudo mkdir -p "$(dirname "$GETTY_CONF")"
 sudo tee "$GETTY_CONF" > /dev/null << EOF
@@ -183,8 +208,8 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable getty@tty1.service
 
-# ── 7. X session auto-start ───────────────────────────────────────────────────
-echo "[7/11] Configuring X session auto-start..."
+# ── 8. X session auto-start ───────────────────────────────────────────────────
+echo "[8/13] Configuring X session auto-start..."
 
 BASHRC_MARK="# door-lock: auto startx"
 if ! sudo grep -qF "$BASHRC_MARK" "${KIOSK_HOME}/.bashrc" 2>/dev/null; then
@@ -208,8 +233,8 @@ sudo chmod +x "${KIOSK_HOME}/.xinitrc"
 sudo chown "${KIOSK_USER}:${DOOR_LOCK_GROUP}" "${KIOSK_HOME}/.bashrc" "${KIOSK_HOME}/.xinitrc"
 echo "  .xinitrc configured"
 
-# ── 8. Display sleep cron ─────────────────────────────────────────────────────
-echo "[8/11] Registering display sleep cron..."
+# ── 9. Display sleep cron ─────────────────────────────────────────────────────
+echo "[9/13] Registering display sleep cron..."
 CRON_MARK="# door-lock: display power"
 if ! sudo crontab -u "$KIOSK_USER" -l 2>/dev/null | grep -qF "$CRON_MARK"; then
     (sudo crontab -u "$KIOSK_USER" -l 2>/dev/null; \
@@ -222,14 +247,29 @@ else
     echo "  Cron already registered, skipping"
 fi
 
-# ── 9. Create daemon runtime directories ─────────────────────────────────────
-echo "[9/11] Creating daemon runtime directories..."
+# ── 10. Grant bluetooth setup permissions ──────────────────────────────────────
+echo "[10/13] Granting bluetooth setup permissions to ${DAEMON_SVC_USER}..."
+# 데몬이 기동마다 rfkill을 풀고 bluetoothd를 능동 재시작한다(door-lock-daemon.py의
+# _prepare_bluetooth_adapter() 참고 — rfkill 소프트 블록이 hci0을 DOWN으로 묶어두는
+# 게 실기에서 확인된 실제 원인이었다). 블루투스는 이 데몬 전용이라 필요한 두
+# 명령만 최소로 내준다.
+SUDOERS_FILE="/etc/sudoers.d/door-lock-bluetooth"
+{
+    echo "${DAEMON_SVC_USER} ALL=(root) NOPASSWD: /usr/sbin/rfkill unblock bluetooth"
+    echo "${DAEMON_SVC_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart bluetooth"
+} | sudo tee "$SUDOERS_FILE" > /dev/null
+sudo chmod 0440 "$SUDOERS_FILE"
+sudo visudo -cf "$SUDOERS_FILE" > /dev/null
+echo "  ${SUDOERS_FILE} installed"
+
+# ── 11. Create daemon runtime directories ─────────────────────────────────────
+echo "[11/13] Creating daemon runtime directories..."
 sudo mkdir -p /var/log/door-lock /var/cache/door-lock
 sudo chown "${DAEMON_SVC_USER}:${DAEMON_SVC_USER}" /var/log/door-lock /var/cache/door-lock
 echo "  /var/log/door-lock and /var/cache/door-lock created"
 
-# ── 10. Register daemon systemd service ───────────────────────────────────────
-echo "[10/11] Registering daemon systemd service..."
+# ── 12. Register daemon systemd service ───────────────────────────────────────
+echo "[12/13] Registering daemon systemd service..."
 SERVICE_FILE="/etc/systemd/system/door-lock-daemon.service"
 sudo tee "$SERVICE_FILE" > /dev/null << EOF
 [Unit]
@@ -253,8 +293,8 @@ sudo systemctl enable door-lock-daemon.service
 sudo systemctl restart door-lock-daemon.service
 echo "  door-lock-daemon.service registered and started"
 
-# ── 11. Check GPIO permissions ────────────────────────────────────────────────
-echo "[11/11] Checking GPIO permissions..."
+# ── 13. Check GPIO permissions ────────────────────────────────────────────────
+echo "[13/13] Checking GPIO permissions..."
 if ! groups "$DAEMON_SVC_USER" | grep -q '\bgpio\b'; then
     echo "  WARNING: ${DAEMON_SVC_USER} is not in the gpio group" >&2
 else
