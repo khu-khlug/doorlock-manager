@@ -60,8 +60,7 @@ some-dir/
 ├── setup-door-lock.sh    # 1. 최초 1회: 패키지 설치 + 파일 다운로드 + 환경 구성
 ├── start-door-lock.sh    # 2. 부팅마다: X 세션 시작 + Chromium 키오스크 실행
 ├── stop-door-lock.sh     # 3. 필요 시: 모든 프로세스 정지
-├── door-lock-daemon.py   # 4. 데몬: Flask HTTP 서버 + GPIO 제어 (systemd 관리)
-└── setup-door-lock-test.sh  # (테스트용) 자동 실행 없이 데몬만 수동으로 띄우는 셋업
+└── door-lock-daemon.py   # 4. 데몬: Flask HTTP 서버 + GPIO 제어 (systemd 관리)
 ```
 
 ### 1. `setup-door-lock.sh` — 최초 설치
@@ -182,11 +181,11 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
 - 백엔드 API 스펙이 블루투스 인증을 위해 바뀌면(새 엔드포인트 또는 기존 엔드포인트의 payload 확장) `Ble._confirm_candidate()`가 `attempt_unlock`에 넘기는 `endpoint`/`payload` 값만 그에 맞게 구성하면 되고, `attempt_unlock`/`request_backend_authorization` 자체는 손댈 필요 없다. 현재는 `/unlock`과 동일한 `/internal/door-lock/accesses` + `{"number", "roomNumber"}`를 그대로 재사용한다는 가정이며, 백엔드팀 확인이 필요하다.
 - **근접 판정은 목업이다.** `select_closest_candidate_in_range()`(모듈 최상위 자유 함수, `Ble` 클래스 밖에 있다 — 알고리즘을 통째로 갈아끼울 사람이 클래스 구조를 몰라도 바로 찾도록)와 임계값 상수 `BLE_PROXIMITY_RSSI_THRESHOLD`는 현재 RSSI 최댓값 + 임계값 비교로 임시 구현돼 있다. 실제 거리 판별 알고리즘으로 교체될 예정이다.
 - **BLE UUID와 payload 규격은 앱이 기준이다.** 앱(`parksiwoo2/doorlock-frontend`) 원격 `main`의 `BleConstants.kt`/`BlePayloadCodec.kt`를 근거로 삼고, 어긋나면 Pi를 고친다. 코드 상수 `Ble.UUID_PRESENCE`/`UUID_REGISTER`/`UUID_CONFIRM`/`UUID_HEARTBEAT_ACK`가 기본값이고, 재배포 없이 바꾸려면 `/etc/door-lock/ble-uuids` 파일을 쓴다(아래 "BLE UUID 설정 파일" 참고). **세션토큰은 `Ble.RANDOM_ID_MIN`(=1)~`Ble.RANDOM_ID_MAX`(=255)이며 `0`은 앱이 명단의 빈 슬롯으로 쓰는 예약값이라 절대 발급하지 않는다.**
-- **재실 명단 payload는 항상 정확히 `Ble.ROSTER_LENGTH`(=24)바이트여야 한다**(`Ble.Payload.roster_payload()`). 앱의 `matchesHeartbeatRoster`가 길이를 엄격히 검사하므로 인원수만큼만 보내면 폰이 통째로 무시한다. **정원(24명)을 넘는 등록 요청은 `Ble.Registry.register()`가 그냥 실패시킨다** — 그래서 명단은 항상 한 묶음이면 충분하다. 이 계약들(24바이트 고정, 토큰 0 금지, 정원 초과 시 실패)은 `test_door_lock_daemon.py`가 테스트로 못박고 있다.
+- **재실 명단 payload는 항상 정확히 `Ble.ROSTER_LENGTH`(=24)바이트여야 한다**(`Ble.Payload.roster_payload()`). 앱의 `matchesHeartbeatRoster`가 길이를 엄격히 검사하므로 인원수만큼만 보내면 폰이 통째로 무시한다. **정원(24명)을 넘는 등록 요청은 `Ble.Registry.register()`가 그냥 실패시킨다** — 그래서 명단은 항상 한 묶음이면 충분하다.
 - 학번은 원문이 아니라 앱과 동일한 인코딩(2바이트씩 맞바꾼 뒤 16진수 20자, `Ble.Payload.decode_student_id`/`encode_student_id`)으로 주고받는다. 등록 요청(21바이트)과 하트비트(2바이트)는 같은 REGISTER UUID로 오지만 payload 길이로 구분한다(`Ble._on_register_signal`). **하트비트는 항상 즉시 처리해야 한다** — 이걸 어기면 이미 안에 있는 사람에게 문이 반복해서 열린다.
 - 근접 스캔(`Ble._proximity_scan_loop`)/만료 정리(`Ble._reap_loop`)는 각각 독립된 `threading.Timer` 체인으로 자기 자신을 재예약한다. 콜백 안에서 예외가 나도 재예약 자체는 계속되도록 각 루프가 자체적으로 try/except를 감싸거나 `_log_callback_exceptions` 데코레이터를 쓴다.
 - **24시간 운용을 전제로 로그를 아낀다.** 수신 신호마다 로그를 남기면 초당 수십 줄이 쌓여 SD 카드 수명과 로그 가독성을 모두 해친다. 후보는 처음 잡혔을 때만 `INFO`로 남기고, 그 외 `INFO`에는 실제 사건(개방·등록·만료·광고 등록/해제·오류)만 남긴다.
-- `dbus`/`gi`(PyGObject) 의존성은 `Ble.Adapter`/`Ble.Advertising` 안에서만 지연 import한다 — 나머지 로직(상태 전이, 후보 선택, payload 생성 등)은 이 라이브러리들이 없는 개발 환경에서도 import/테스트 가능해야 하기 때문이다(`test_door_lock_daemon.py`). `org.bluez.LEAdvertisement1`을 구현하는 클래스만 `dbus.service.Object` 상속이 필수라 클래스로 두되, 정의 자체를 `Ble.Advertising._advertisement_class()` 팩토리 안에 넣어 이 규칙을 지킨다.
+- `dbus`/`gi`(PyGObject) 의존성은 `Ble.Adapter`/`Ble.Advertising` 안에서만 지연 import한다 — 나머지 로직(상태 전이, 후보 선택, payload 생성 등)은 이 라이브러리들이 없는 개발 환경에서도 import할 수 있어야 하기 때문이다. `org.bluez.LEAdvertisement1`을 구현하는 클래스만 `dbus.service.Object` 상속이 필수라 클래스로 두되, 정의 자체를 `Ble.Advertising._advertisement_class()` 팩토리 안에 넣어 이 규칙을 지킨다.
 
 #### BLE 클래스 구조
 
@@ -226,13 +225,9 @@ confirm=2222
 heartbeat_ack=3333
 ```
 
-두 setup 스크립트(`setup-door-lock.sh`/`setup-door-lock-test.sh`) 모두 파일이 없을 때만 위 기본값으로
-생성한다(있으면 건드리지 않는다 — `/etc/door-lock/api-key`와 같은 멱등성 패턴). 앱과 UUID가
+`setup-door-lock.sh`는 파일이 없을 때만 위 기본값으로 생성한다(있으면 건드리지 않는다 —
+`/etc/door-lock/api-key`와 같은 멱등성 패턴). 앱과 UUID가
 달라지면 이 파일을 고치고 데몬을 재시작하면 되고, 코드 재배포는 필요 없다.
-
-### `setup-door-lock-test.sh` — 테스트 전용 셋업
-
-실기에서 BLE를 수동으로 검증할 때 쓴다. 운영용 `setup-door-lock.sh`와 달리 **systemd 서비스를 등록하지 않는다** — 전원만 켜도 데몬이 자동 실행되면 수동 실행분과 포트·어댑터를 두고 경합해서 테스트가 불가능하다. 키오스크 UI(X11/Chromium/폰트/PWA 정책/자동 로그인/디스플레이 cron)도 설치하지 않고, GitHub에서 받지 않고 **스크립트와 같은 디렉터리의 `door-lock-daemon.py`를 쓴다**(개발 중인 파일을 scp로 올려 테스트하므로). 데몬은 `/opt/door-lock/`에 설치되고, 마지막에 실행 명령을 그대로 출력한다.
 
 ### BLE 계층별 한계 (실기 + 공식 소스로 확인한 것)
 
@@ -288,4 +283,4 @@ sudo btmgmt advinfo     # Secondary Channel 항목이 있으면 동시 광고 �
 dmesg | grep -i blue    # Frame reassembly failed 가 없어야 정상
 ```
 
-`setup-door-lock.sh`의 BLE 의존성은 `bluez`/`python3-dbus`/`python3-gi`면 충분하다(BLE는 BlueZ D-Bus API를 직접 쓰므로 `bluezero`가 필요 없다). 데몬은 CLI 인자 없이 항상 상시 근접 스트림으로 동작한다 — 테스트 시엔 `setup-door-lock-test.sh`로 셋업하고 수동 실행한다.
+`setup-door-lock.sh`의 BLE 의존성은 `bluez`/`python3-dbus`/`python3-gi`면 충분하다(BLE는 BlueZ D-Bus API를 직접 쓰므로 `bluezero`가 필요 없다). 데몬은 CLI 인자 없이 항상 상시 근접 스트림으로 동작한다.
