@@ -108,43 +108,69 @@ Pi에서 한 번만 실행.
 
 ### 4. `door-lock-daemon.py` — Python 데몬
 
-Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.service`가 관리하며 실패 시 자동 재시작.
+> **⚠️ 이 문서에 적힌 BLE UUID(`0312`/`1111`/`2222`/`3333`)는 기본값일 뿐이다.**
+> 실제 도어락에 적용할 때는 **방마다 서로 다른 UUID로 바꿔서 세팅해야 한다.** 
+> 여러 방이 같은 UUID를 쓰면 옆방 라즈베리파이의 광고에 폰이 반응하고, 옆방 폰의 등록 요청을 이쪽에서 받게 된다.
+>
+> 세팅은 코드를 고칠 필요 없이 `/etc/door-lock/ble-uuids` 파일의 값만 바꾸면 된다**(자세한 형식은 아래 "BLE UUID 설정 파일" 참고).
+> 값을 바꾼 뒤 `sudo systemctl restart door-lock-daemon.service`로 데몬을 재시작하면 적용된다.
+> **단, UUID는 앱과 반드시 같아야 하므로 앱 쪽 설정도 함께 맞춰야 한다.**
 
-- `GET /health` — 데몬 상태 확인
-- `POST /unlock` — 학번과 방 번호를 백엔드에 전달해 인증 후 GPIO 릴레이 개방, 인증된 회원 이름 반환
-  - `127.0.0.1`에서만 요청 수락
-  - 백엔드 타임아웃 5초, 실패 시 504/502 반환
-- 출입 시도·성공·실패를 `/var/log/door-lock/daemon.log`에 기록 (5MB × 3개 순환)
-- 백엔드 인증 + 릴레이 개방 로직은 `attempt_unlock(endpoint, payload, source)` 함수로 공용화되어 있다. `/unlock`(`source="keypad"`, 학번 직접 입력)과 블루투스 인증(`source="bluetooth"`, 아래 참고) 양쪽이 이 함수를 공통으로 호출한다.
-- `start_reader()`는 블루투스 인증을 처리한다. 앱이 BLE 광고로 학번을 보내면 이를 감지해 `attempt_unlock(..., source="bluetooth")`을 호출하고, 성공하면 문이 열린다. BLE 관련 상태/함수는 전부 `Ble` 클래스(및 그 안에 중첩된 `Ble.Payload`/`Ble.Registry`/`Ble.Advertising`/`Ble.Adapter`)에 있다 — 자세한 구조는 "BLE 클래스 구조" 절 참고. 프로토콜 요약:
-  - **UUID와 payload 규격은 앱이 기준이다.** 안드로이드 앱(`parksiwoo2/doorlock-frontend`) 원격 `main`의 `BleConstants.kt` / `BlePayloadCodec.kt`에 맞춰 Pi를 고친다. UUID는 코드 상수(`Ble.UUID_*`)가 기본값이고, 재배포 없이 바꾸려면 `/etc/door-lock/ble-uuids` 파일로 덮어쓸 수 있다(아래 "BLE UUID 설정 파일" 참고).
+Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.service`가 관리하며 실패 시 자동 재시작. 출입 시도·성공·실패는 `/var/log/door-lock/daemon.log`에 기록된다(5MB × 3개 순환).
 
-    | UUID | 방향 | payload |
-    |---|---|---|
-    | `0312` PRESENCE | Pi → 폰 | 더미 1바이트 (앱은 UUID 존재만 확인) |
-    | `1111` REGISTER | **폰 → Pi** | 21바이트 = 인코딩 학번(20) + 공개여부(1) / **2바이트** = 세션토큰(1) + 공개여부(1) |
-    | `2222` CONFIRM | Pi → 폰 | 21바이트 = 인코딩 학번(20) + 세션토큰(1) |
-    | `3333` HEARTBEAT_ACK | Pi → 폰 | **정확히 24바이트** 재실 명단 |
+#### HTTP API
 
-  - **폰이 보내는 신호는 `1111` 하나뿐이고 payload 길이로 의미가 갈린다** — 21바이트는 등록 요청, 2바이트는 하트비트. 길이로 명확히 구분되며, **하트비트는 항상 즉시 처리한다**(`Ble._on_register_signal`). 이걸 어기면 등록 기기가 30초 뒤 만료되고 재등록하며 **이미 안에 있는 사람에게 문이 다시 열리는 버그**가 생긴다.
-  - **상시 근접 스트림**: 트리거로 수집 윈도우를 열고 닫는 방식이 아니라, Pi는 항상 스캔하며 **1초마다 그 사이 들어온 등록 요청을 배치로 모은다**(같은 폰이 여러 번 보내면 최신 것만 남긴다, `Ble.Registry.add_candidate`/`snapshot_and_clear_candidates`). 그 1초치 후보 목록을 `select_closest_candidate_in_range()`에 넘겨 임계 거리 이내에 있는 후보 중 가장 가까운 것 하나를 고른다 — 범위 안에 아무도 없으면 아무 일도 일어나지 않는다. **거리 계산과 임계값은 목업이다**(현재는 RSSI 최댓값 + 임계값 비교로 임시 구현, `BLE_PROXIMITY_RSSI_THRESHOLD`) — 정확한 알고리즘은 별도로 구현될 예정이다. 선택된 후보에 대해서만 `attempt_unlock` 1회를 호출하고, 성공하면 등록 + 확인 광고를 켠다. **이미 등록된 기기를 후보에서 제외하는 검사는 후보를 넣을 때가 아니라 꺼낼 때(`Ble.Registry.snapshot_and_clear_candidates`) 한다** — 후보 삽입과 실제 인증 사이에는 최대 1초(배치 주기) + 백엔드 왕복 시간이 있어서, 넣을 때만 검사하면 그 사이에 등록이 끝난 기기가 다음 배치에 남아 재인증된다. 그러면 같은 사람에게 문이 다시 열리고 세션토큰까지 새로 발급되어, 폰이 든 토큰과 재실 명단이 어긋난다. 30초 이상 하트비트가 없으면 등록 목록에서 제거한다.
-  - **재실 명단(`3333`)은 항상 정확히 24바이트다.** 등록된 세션토큰을 앞에서부터 채우고 뒤는 `0`으로 패딩한다(`Ble.Payload.roster_payload()`). 앱의 `matchesHeartbeatRoster`가 `payload.size != 24`면 무조건 거부하므로 반드시 지켜야 한다. **정원은 24명이 하드 캡이다** — `Ble.Registry.register()`가 24명이 이미 등록된 상태에서의 새 등록 요청을 그냥 실패시킨다(`attempt_unlock`조차 호출하지 않는다). 그래서 명단을 여러 묶음으로 나눠 순환할 필요가 없다.
-  - **세션토큰은 1~255이며 `0`은 발급하지 않는다**(`Ble.Registry._allocate_random_id`). `0`은 앱이 명단의 빈 슬롯으로 해석하는 예약값이라, 0을 주면 그 기기는 명단에서 자기 토큰을 영영 못 찾는다.
-  - 학번은 앱의 `BlePayloadCodec.encodeStudentId()`와 동일한 방식(2바이트씩 맞바꾼 뒤 16진수 20자로 인코딩)으로 주고받는다 — `Ble.Payload.decode_student_id()`/`encode_student_id()`가 이 인코딩을 처리한다.
-  - **송출은 광고 인스턴스 3개로 나눠 등록한다**(아래 "BLE 계층별 한계" 참고). 신호마다 요구되는 주기가 다르기 때문이다. **세 인스턴스 모두 기동 시 상시 등록해두고, 운영 중엔 절대 register/unregister를 다시 하지 않는다** — 이벤트 시에만 register하는 방식은 AlreadyExists 영구 교착을 만든다. "송출 여부"는 등록 여부가 아니라 **내용을 바꾸는 것**으로 조절한다.
+- `GET /health` — 데몬 상태 확인. 키오스크 프론트엔드가 생존 여부를 이걸로 판단한다.
+- `POST /unlock` — 학번과 방 번호를 백엔드에 넘겨 인증하고, 통과하면 릴레이를 열고 회원 이름을 돌려준다. `127.0.0.1`에서만 받고, 백엔드 타임아웃은 5초이며 실패 시 504/502를 반환한다.
 
-    | 인스턴스 | 평소(비활성) | 인증 성공 시 |
-    |---|---|---|
-    | 트리거 `0312` | `Duration=1s`, ServiceUUIDs+ServiceData 실음(앱이 `setServiceUuid`로 거름) | 변화 없음 |
-    | 명단 `3333` | `Duration=1s`, 등록된 세션토큰 목록(24바이트 고정) | 새 토큰 반영 시에만 payload 갱신 |
-    | 확인 `2222` | `Duration=1s`, payload는 **21바이트 전부 0**(어떤 실제 학번과도 절대 안 겹침 — 앱 필터가 라디오 단계에서 걸러줌) | `Duration=5s`로 잠깐 키우고 payload를 실제 값(학번+토큰)으로 채운 뒤, `BLE_CONFIRM_CONTENT_SECONDS`(5초) 뒤 둘 다 원복 |
+백엔드 인증과 릴레이 개방은 한 함수로 공용화돼 있어 키패드 경로(`/unlock`)와 블루투스 경로가 똑같이 쓴다.
 
-    평소엔 세 인스턴스가 1+1+1=3초 주기로 균등 순환하다가, 확인이 활성화되면 그 구간만 1+1+5=7초 주기가 되고 확인 채널이 그중 5초(약 71%)를 차지한다. `Duration` 변경 자체는 커널이 구조체 값만 갱신해 사실상 공짜지만(비확장 광고 컨트롤러는 HCI 왕복도 없음), 이미 진행 중인 순번을 끊고 끼어들진 못하므로 로테이션 순번이 돌아오는 대기 시간(최악 ~2초)은 그대로 남는다. 그래도 앱의 확인 대기 하드 타임아웃(`BleRelayService.kt`의 `openConfirmationTimeoutMillis = 10_000L`) 대비 여유가 충분하다.
+#### BLE 프로토콜 규격
 
-  - 광고와 스캔 모두 `bluezero` 없이 BlueZ D-Bus API를 직접 쓴다. 내용 교체는 unregister/register가 아니라 광고 오브젝트의 `PropertiesChanged` 신호로 한다. 스캔은 `InterfacesAdded`/`PropertiesChanged` 시그널 payload에서 `ServiceData`/`RSSI`를 직접 읽는다.
-  - 어댑터 경로는 하드코딩하지 않고 `org.bluez.Adapter1`을 구현한 오브젝트를 찾아 쓴다(`_find_adapter_path`). `BLE_ADAPTER` 환경변수로 강제 지정할 수 있다 — USB 동글을 꽂아 어댑터가 늘었을 때 필요하다.
-  - 트리거 폴링/명단 묶음 순환/만료 정리 같은 주기 작업은 `GLib.timeout_add`가 아니라 `threading.Timer` 자기재예약 방식(`_refresh_schedules`와 같은 패턴)으로 돈다 — 실기에서 이 환경의 `dbus-python`+PyGObject 조합에서 `GLib.timeout_add`가 최초 1회 이후 반복 실행되지 않는 문제가 확인돼서 우회했다. D-Bus 시그널 콜백(`_on_bluez_properties_changed` 등)과 `GLib.MainLoop().run()`은 그대로 GLib 쪽에 남아있다.
+**UUID와 payload 규격은 앱이 기준이다.** 안드로이드 앱(`parksiwoo2/doorlock-frontend`)에 맞춰 Pi를 고친다.
 
+| UUID | 방향 | payload |
+|---|---|---|
+| `0312` PRESENCE | Pi → 폰 | 더미 1바이트 (앱은 UUID 존재만 확인) |
+| `1111` REGISTER | **폰 → Pi** | 21바이트 = 인코딩 학번(20) + 공개여부(1) / **2바이트** = 세션토큰(1) + 공개여부(1) |
+| `2222` CONFIRM | Pi → 폰 | 21바이트 = 인코딩 학번(20) + 세션토큰(1) |
+| `3333` HEARTBEAT_ACK | Pi → 폰 | **정확히 24바이트** 재실 명단 |
+
+- **폰이 보내는 신호는 `1111` 하나뿐이고 payload 길이로 의미가 갈린다** — 21바이트는 등록 요청, 2바이트는 하트비트. 길이로 명확히 구분되므로 **하트비트는 어떤 상태에서든 즉시 처리한다.** 이걸 어기면 등록 기기가 30초 뒤 만료되고 재등록하면서 **이미 안에 있는 사람에게 문이 다시 열린다.**
+- 학번은 원문이 아니라 앱과 동일한 인코딩(2바이트씩 맞바꾼 뒤 16진수 20자)으로 주고받는다.
+- **세션토큰은 1~255이며 `0`은 발급하지 않는다.** `0`은 앱이 재실 명단의 빈 슬롯으로 해석하는 예약값이라, 0을 받은 기기는 명단에서 자기 토큰을 영영 못 찾는다.
+- **재실 명단(`3333`)은 항상 정확히 24바이트다.** 등록된 세션토큰을 앞에서부터 채우고 뒤는 `0`으로 패딩한다. 앱이 길이를 엄격히 검사하므로 인원수만큼만 보내면 폰이 통째로 무시한다. 기기 하나씩 번갈아 응답하는 게 아니라 명단을 통째로 보내므로, 인원이 늘어도 응답 주기가 길어지지 않고 광고 내용도 등록·만료 때만 바뀐다.
+
+#### 인증 흐름 — 상시 근접 스트림
+
+Pi는 트리거로 수집 창을 열고 닫지 않고 **항상 스캔한다.**
+
+1. **1초마다** 그 사이 들어온 등록 요청을 배치로 모은다. 같은 폰이 여러 번 보내면 최신 것만 남는다.
+2. 그 1초치 후보 중 **임계 신호 세기 이상인 것들 가운데 가장 가까운 하나**를 고른다. 범위 안에 아무도 없으면 아무 일도 일어나지 않는다.
+3. 선택된 한 명에 대해서만 백엔드 인증을 1회 호출하고, 통과하면 문을 열고 세션토큰을 발급해 재실 명단에 넣은 뒤 확인 광고를 잠깐 켠다.
+4. 30초 이상 하트비트가 없는 기기는 명단에서 제거한다.
+
+**정원은 24명이 하드 캡이다** — 명단 payload가 24바이트 고정이기 때문이다. 정원을 넘는 등록 요청은 실패로 처리하므로 명단을 여러 묶음으로 나눠 순환할 필요가 없다.
+
+**이미 등록된 기기를 후보에서 빼는 검사는 후보를 넣을 때가 아니라 꺼낼 때 한다.** 후보로 들어간 뒤 실제로 인증되기까지 최대 1초(배치 주기) + 백엔드 왕복 시간이 걸리는데, 넣을 때만 검사하면 그 사이에 등록이 끝난 기기가 다음 배치에 그대로 남아 재인증된다. 그러면 같은 사람에게 문이 다시 열리고 세션토큰까지 새로 발급되어, 폰이 든 토큰과 재실 명단이 어긋난다.
+
+#### 광고 송출
+
+신호마다 요구되는 주기가 달라서 **광고 인스턴스 3개로 나눠 등록한다**(아래 "BLE 계층별 한계" 참고). **세 개 모두 기동 시 등록해두고 운영 중에는 등록/해제를 다시 하지 않는다** — 이벤트마다 등록하는 방식은 영구 교착을 만든다. 송출 여부는 등록이 아니라 **내용을 바꾸는 것**으로 조절한다.
+
+| 인스턴스 | 평소 | 인증 성공 시 |
+|---|---|---|
+| 트리거 `0312` | 송출 지속 1초, UUID 목록 + 데이터 실음(앱이 UUID 목록으로 거름) | 변화 없음 |
+| 명단 `3333` | 송출 지속 1초, 등록된 세션토큰 목록(24바이트 고정) | 새 토큰이 생겼을 때만 내용 갱신 |
+| 확인 `2222` | 송출 지속 1초, 내용은 **21바이트 전부 0**(어떤 실제 학번과도 겹치지 않아 앱 필터가 라디오 단계에서 걸러준다) | 5초 동안 실제 값(학번+토큰)으로 채우고 송출 지속도 5초로 키운 뒤 원복 |
+
+평소엔 세 인스턴스가 1+1+1=3초 주기로 균등 순환하고, 확인이 활성화된 동안만 1+1+5=7초 주기가 되어 확인 채널이 그중 5초를 차지한다. 송출 지속시간 변경 자체는 커널이 값만 갱신해 사실상 공짜지만 진행 중인 순번에 끼어들지는 못하므로, 순번이 돌아오기까지 최악 2초를 기다린다. 앱의 확인 대기 타임아웃(10초) 대비 여유가 충분하다.
+
+#### 구현 메모
+
+- 광고와 스캔 모두 BlueZ D-Bus API를 직접 쓴다. 내용 교체는 등록을 유지한 채 속성 변경 신호로 하고, 스캔은 시그널에 실려온 데이터와 신호 세기를 그대로 읽는다.
+- 어댑터 경로는 하드코딩하지 않고 자동 탐색한다. USB 동글을 꽂아 어댑터가 늘었을 때는 `BLE_ADAPTER` 환경변수로 강제 지정할 수 있다.
+- 근접 스캔·만료 정리 같은 주기 작업은 `GLib.timeout_add`가 아니라 `threading.Timer` 자기재예약 방식으로 돈다 — 이 환경의 `dbus-python`+PyGObject 조합에서 `GLib.timeout_add`가 최초 1회 이후 반복되지 않는 것이 실기에서 확인됐다. D-Bus 시그널 콜백과 메인루프는 그대로 GLib 쪽에 남아 있다.
 ---
 
 ## 유지보수 규칙
@@ -172,20 +198,33 @@ Flask HTTP 서버로 `127.0.0.1:8080`에서 수신. systemd `door-lock-daemon.se
 
 ### `door-lock-daemon.py`
 
-- `/health` 엔드포인트는 반드시 유지한다. 키오스크 프론트엔드가 데몬 생존 여부를 이 엔드포인트로 확인한다.
-- GPIO 핀 번호 변경 시 `GPIO_PIN` 상수만 수정하면 된다.
-- 백엔드 URL은 `BACKEND_URL` 환경변수로 주입되며 `setup-door-lock.sh`가 자동으로 설정한다.
-- 방 번호는 `ROOM_NUMBER` 환경변수로 주입되며 `setup-door-lock.sh` 실행 시 대화식으로 입력받아 설정한다.
-- 로그 파일 경로는 `LOG_FILE` 상수로 지정되어 있으며 디렉토리가 없으면 자동 생성된다.
-- 블루투스 인증은 `start_reader()`가 기동하는 전용 스레드(`_ble.start_logged`)에서 처리한다. BLE 관련 상태와 함수는 모두 `Ble` 클래스 아래 중첩돼 있다 — 구조는 바로 아래 "BLE 클래스 구조" 참고.
-- 백엔드 API 스펙이 블루투스 인증을 위해 바뀌면(새 엔드포인트 또는 기존 엔드포인트의 payload 확장) `Ble._confirm_candidate()`가 `attempt_unlock`에 넘기는 `endpoint`/`payload` 값만 그에 맞게 구성하면 되고, `attempt_unlock`/`request_backend_authorization` 자체는 손댈 필요 없다. 현재는 `/unlock`과 동일한 `/internal/door-lock/accesses` + `{"number", "roomNumber"}`를 그대로 재사용한다는 가정이며, 백엔드팀 확인이 필요하다.
-- **근접 판정은 목업이다.** `select_closest_candidate_in_range()`(모듈 최상위 자유 함수, `Ble` 클래스 밖에 있다 — 알고리즘을 통째로 갈아끼울 사람이 클래스 구조를 몰라도 바로 찾도록)와 임계값 상수 `BLE_PROXIMITY_RSSI_THRESHOLD`는 현재 RSSI 최댓값 + 임계값 비교로 임시 구현돼 있다. 실제 거리 판별 알고리즘으로 교체될 예정이다.
-- **BLE UUID와 payload 규격은 앱이 기준이다.** 앱(`parksiwoo2/doorlock-frontend`) 원격 `main`의 `BleConstants.kt`/`BlePayloadCodec.kt`를 근거로 삼고, 어긋나면 Pi를 고친다. 코드 상수 `Ble.UUID_PRESENCE`/`UUID_REGISTER`/`UUID_CONFIRM`/`UUID_HEARTBEAT_ACK`가 기본값이고, 재배포 없이 바꾸려면 `/etc/door-lock/ble-uuids` 파일을 쓴다(아래 "BLE UUID 설정 파일" 참고). **세션토큰은 `Ble.RANDOM_ID_MIN`(=1)~`Ble.RANDOM_ID_MAX`(=255)이며 `0`은 앱이 명단의 빈 슬롯으로 쓰는 예약값이라 절대 발급하지 않는다.**
-- **재실 명단 payload는 항상 정확히 `Ble.ROSTER_LENGTH`(=24)바이트여야 한다**(`Ble.Payload.roster_payload()`). 앱의 `matchesHeartbeatRoster`가 길이를 엄격히 검사하므로 인원수만큼만 보내면 폰이 통째로 무시한다. **정원(24명)을 넘는 등록 요청은 `Ble.Registry.register()`가 그냥 실패시킨다** — 그래서 명단은 항상 한 묶음이면 충분하다.
-- 학번은 원문이 아니라 앱과 동일한 인코딩(2바이트씩 맞바꾼 뒤 16진수 20자, `Ble.Payload.decode_student_id`/`encode_student_id`)으로 주고받는다. 등록 요청(21바이트)과 하트비트(2바이트)는 같은 REGISTER UUID로 오지만 payload 길이로 구분한다(`Ble._on_register_signal`). **하트비트는 항상 즉시 처리해야 한다** — 이걸 어기면 이미 안에 있는 사람에게 문이 반복해서 열린다.
-- 근접 스캔(`Ble._proximity_scan_loop`)/만료 정리(`Ble._reap_loop`)는 각각 독립된 `threading.Timer` 체인으로 자기 자신을 재예약한다. 콜백 안에서 예외가 나도 재예약 자체는 계속되도록 각 루프가 자체적으로 try/except를 감싸거나 `_log_callback_exceptions` 데코레이터를 쓴다.
-- **24시간 운용을 전제로 로그를 아낀다.** 수신 신호마다 로그를 남기면 초당 수십 줄이 쌓여 SD 카드 수명과 로그 가독성을 모두 해친다. 후보는 처음 잡혔을 때만 `INFO`로 남기고, 그 외 `INFO`에는 실제 사건(개방·등록·만료·광고 등록/해제·오류)만 남긴다.
-- `dbus`/`gi`(PyGObject) 의존성은 `Ble.Adapter`/`Ble.Advertising` 안에서만 지연 import한다 — 나머지 로직(상태 전이, 후보 선택, payload 생성 등)은 이 라이브러리들이 없는 개발 환경에서도 import할 수 있어야 하기 때문이다. `org.bluez.LEAdvertisement1`을 구현하는 클래스만 `dbus.service.Object` 상속이 필수라 클래스로 두되, 정의 자체를 `Ble.Advertising._advertisement_class()` 팩토리 안에 넣어 이 규칙을 지킨다.
+#### 설정과 진입점
+
+- `/health` 엔드포인트는 반드시 유지한다. 키오스크 프론트엔드가 데몬 생존 여부를 이걸로 확인한다.
+- GPIO 핀 번호는 `GPIO_PIN`, 로그 경로는 `LOG_FILE` 상수 하나만 고치면 된다(로그 디렉터리는 없으면 자동 생성).
+- 백엔드 URL(`BACKEND_URL`)과 방 번호(`ROOM_NUMBER`)는 환경변수로 주입되며 `setup-door-lock.sh`가 설정한다.
+- 백엔드 인증 + 릴레이 개방은 `attempt_unlock()` 하나로 공용화돼 있고 키패드 경로와 블루투스 경로가 함께 쓴다. 백엔드 스펙이 바뀌면 호출부에서 넘기는 엔드포인트/payload만 맞추면 되고 이 함수 자체는 손댈 필요 없다. 현재 블루투스 인증은 키패드와 같은 엔드포인트를 재사용한다는 가정이며 백엔드팀 확인이 필요하다.
+
+#### 앱과의 계약 (어기면 폰이 응답을 통째로 무시한다)
+
+기준은 항상 앱(`parksiwoo2/doorlock-frontend`)의 `BleConstants.kt` / `BlePayloadCodec.kt`다. 어긋나면 Pi를 고친다.
+
+- **UUID 4개**는 코드 상수가 기본값이고, 재배포 없이 바꾸려면 `/etc/door-lock/ble-uuids`를 쓴다(아래 "BLE UUID 설정 파일" 참고). **방마다 다른 값으로 세팅해야 한다.**
+- **세션토큰은 1~255이며 `0`은 절대 발급하지 않는다.** `0`은 앱이 재실 명단의 빈 슬롯으로 해석하는 예약값이라, 0을 받은 기기는 명단에서 자기 토큰을 영영 못 찾는다.
+- **재실 명단 payload는 항상 정확히 24바이트다.** 앱이 길이를 엄격히 검사하므로 인원수만큼만 보내면 안 된다. 정원(24명)을 넘는 등록 요청은 실패로 처리하므로 명단은 항상 한 묶음이면 충분하다.
+- **학번은 앱과 같은 인코딩**(2바이트씩 맞바꾼 뒤 16진수 20자)으로 주고받는다.
+- **폰이 보내는 신호는 UUID 하나뿐이고 payload 길이로 의미가 갈린다** — 21바이트는 등록 요청, 2바이트는 하트비트. **하트비트는 어떤 상태에서든 즉시 처리해야 한다.** 이걸 어기면 등록 기기가 30초 뒤 만료되고 재등록하면서 이미 안에 있는 사람에게 문이 반복해서 열린다.
+
+#### 코드 구조 규칙
+
+- BLE 관련 상태와 함수는 전부 `Ble` 클래스 아래 중첩돼 있다. 자세한 구조는 아래 "BLE 클래스 구조" 참고.
+- **근접 판정 함수와 임계값 상수만은 `Ble` 밖 모듈 최상위에 둔다.** 판별 알고리즘을 갈아끼우는 사람이 클래스 구조를 몰라도 바로 찾을 수 있어야 하기 때문이다.
+- **주기 작업은 `threading.Timer`로 자기 자신을 재예약하는 방식만 쓴다** — 이 환경의 `dbus-python`+PyGObject 조합에서 `GLib.timeout_add`는 최초 1회 이후 반복되지 않는다. 콜백에서 예외가 나도 재예약은 계속되도록 각 루프가 try/except를 감싸거나 로깅 데코레이터를 쓴다.
+- **`dbus`/`gi` 의존성은 BLE 어댑터·광고 쪽에서만 지연 import한다.** 나머지 로직(상태 전이, 후보 선택, payload 생성)은 이 라이브러리가 없는 개발 환경에서도 import할 수 있어야 한다. D-Bus 오브젝트 상속이 필수인 광고 클래스만 예외인데, 정의 자체를 팩토리 함수 안에 넣어 이 규칙을 지킨다.
+
+#### 운용
+
+- **24시간 운용을 전제로 로그를 아낀다.** 수신 신호마다 남기면 초당 수십 줄이 쌓여 SD 카드 수명과 가독성을 모두 해친다. 후보는 처음 잡혔을 때만 남기고, `INFO`에는 실제 사건(개방·등록·만료·광고 등록/해제·오류)만 남긴다.
 
 #### BLE 클래스 구조
 
@@ -208,9 +247,9 @@ Ble (상수 + 인스턴스 보유 + 조정 로직)
 `self.advertising.refresh_roster()`/`show_confirm()` 순서로 여러 클래스를 조정하는데, 이런 흐름은
 `Registry`나 `Advertising` 어느 한쪽에 넣으면 그 클래스가 상대방을 알아야 해서 결합이 생긴다.
 
-`select_closest_candidate_in_range()`(근접 판정 목업)와 그 임계값 상수는 의도적으로 `Ble` 밖의
-모듈 최상위에 둔다 — 다른 팀원이 실제 알고리즘으로 교체할 자리라, 클래스 구조를 몰라도 바로
-찾아 고칠 수 있어야 하기 때문이다.
+`select_closest_candidate_in_range()`(근접 판정)와 그 임계값 상수는 의도적으로 `Ble` 밖의
+모듈 최상위에 둔다 — 판별 알고리즘을 갈아끼우는 자리라, 클래스 구조를 몰라도 바로 찾아
+고칠 수 있어야 하기 때문이다.
 
 #### BLE UUID 설정 파일
 
@@ -226,36 +265,27 @@ heartbeat_ack=3333
 ```
 
 `setup-door-lock.sh`는 파일이 없을 때만 위 기본값으로 생성한다(있으면 건드리지 않는다 —
-`/etc/door-lock/api-key`와 같은 멱등성 패턴). 앱과 UUID가
-달라지면 이 파일을 고치고 데몬을 재시작하면 되고, 코드 재배포는 필요 없다.
+`/etc/door-lock/api-key`와 같은 멱등성 패턴). 값을 고치고 데몬을 재시작하면 적용되며, 코드
+재배포는 필요 없다.
+
+**위 값은 어디까지나 기본값이고, 실제 운용에서는 방마다 서로 다른 UUID로 바꿔서 세팅해야 한다.**
+여러 방이 같은 UUID를 쓰면 폰이 옆방 라즈베리파이의 광고에 반응하고, 옆방 폰의 등록 요청이
+이쪽으로 들어온다. UUID는 앱과 반드시 일치해야 하므로 앱 쪽 설정도 같은 값으로 맞춰야 한다.
 
 ### BLE 계층별 한계 (실기 + 공식 소스로 확인한 것)
 
-이 부분은 오래 헤맨 곳이라, 왜 지금 구조인지 근거를 남긴다. 조사에 쓴 BlueZ 5.82(파이에 깔린 그 버전) 소스와 mgmt-api 문서, bluezero 소스는 `ble-research/`에 받아뒀다.
+오래 헤맨 곳이라 왜 지금 구조인지 근거를 남긴다. 조사에 쓴 BlueZ 5.82(파이에 깔린 그 버전) 소스와 mgmt-api 문서, bluezero 소스는 `ble-research/`에 받아뒀다.
 
-- **광고 내용은 등록을 유지한 채 교체할 수 있다.** bluetoothd는 등록에 성공하면 우리 광고 오브젝트에 property watch를 걸고(`src/advertising.c:1384`), `ServiceData` 등이 바뀌었다는 `PropertiesChanged`를 받으면 `refresh_advertisement()`로 컨트롤러에 새 데이터를 밀어넣는다(같은 파일 1300–1323). 그래서 인스턴스는 기동 시 한 번만 등록하면 되고, 이후엔 payload만 갱신한다.
-- **그런데 `bluezero`로는 그게 불가능하다.** `bluezero/advertisement.py:265`의 `Set()`은 파이썬 dict만 조용히 바꾸고 `PropertiesChanged`를 절대 emit하지 않는다. 그래서 예전 구현은 내용을 바꿀 때마다 unregister→register를 반복해야 했다. `Duration`/`Timeout`/`MinInterval`/`MaxInterval`도 `bluezero`의 `props`에 아예 없어 송출 시점·주기를 제어할 방법이 없었다 — 지금 구조가 이 속성들을 쓰므로 `bluezero`로는 되돌아갈 수 없다.
-- **`RegisterAdvertisement`는 반드시 비동기(`reply_handler`/`error_handler`)로 불러야 한다.** 이 메서드는 즉시 응답하지 않는다 — bluetoothd가 먼저 우리 광고 오브젝트로 프록시를 만들어(`advertising.c:1607,1620`) **우리 프로세스로 `Introspect`/`GetAll`을 되돌아 호출**하고, 그 응답을 받아 `client_proxy_added()`(1571) → `parse_advertisement()`(1581)를 거친 뒤에야 응답을 보낸다(등록 함수 자체는 1703에서 `return NULL`로 응답을 미룬다). 그래서 블로킹으로 부르면 **우리 스레드는 응답을 기다리고 bluetoothd는 우리 `GetAll` 응답을 기다리는 데드락**이 되어 25초 뒤 `NoReply`로 끝난다. 등록은 메인루프가 뜬 뒤 처리되도록 `GLib.MainLoop().run()` 직전에 비동기로 건다. **되돌아 호출이 없는 메서드**(`SetDiscoveryFilter`/`StartDiscovery`/`Powered` 설정/`UnregisterAdvertisement` — `Release()`는 문서상 `[noreply]`)는 블로킹이어도 안전하다.
-- **그 `NoReply`가 `org.bluez.Error.AlreadyExists` 영구 교착으로 이어졌다.** `RegisterAdvertisement`는 mgmt 명령이 끝나기 전에 클라이언트를 큐에 넣으므로(`advertising.c:1701`), 타임아웃이 나도 bluetoothd에는 등록이 남는다. 그 뒤 같은 (owner, object path)로 재시도하면 무조건 `AlreadyExists`다(`advertising.c:1733`의 `match_client`). **그래서 등록 실패 시 재시도 루프를 두지 않는다** — 예전에 넣었던 재시도가 일시적 실패를 영구 장애로 승격시켰다. 실패는 재시도 대신 `daemon.log`에 남긴다.
-- **다른 프로세스가 등록한 광고는 우리가 지울 수 없다.** `UnregisterAdvertisement`는 (owner, object path)가 모두 일치해야 동작한다(`advertising.c:1727`). 그래서 기동 시 우리 경로만 정리하고, `ActiveInstances`가 0이 아니면 로그로 남겨 진단에 쓴다. 완전 초기화가 필요하면 `systemctl restart bluetooth`(bluetoothd가 기동 시 커널 인스턴스를 리셋한다)를 쓴다.
-- **동시 광고는 안 된다 — 커널이 교대로 내보낸다.** `sudo btmgmt advinfo`의 supported flags에 Secondary Channel 비트(LE 1M/2M/Coded)가 없어 LE Extended Advertising 미지원이고, 그 경우 커널이 인스턴스들을 *소프트웨어 라운드로빈으로 시분할*한다(`mgmt-api.txt`의 Add Advertising 설명). 즉 `Max instances: 5`는 "동시 5개"가 아니라 "로테이션 큐 5개"다. 인스턴스 3개를 등록하되 `Duration`으로 각자의 airtime을 배분하는 이유가 이것이다.
-- **payload 한도는 24바이트다.** legacy 광고 31바이트에서 ServiceData AD 헤더 4바이트를 빼고 BlueZ가 Flags AD(3바이트)를 붙일 여지까지 감안한 값이며 `Ble.MAX_SERVICE_DATA_BYTES`로 상수화했다. **Service UUID 목록 AD는 4바이트를 더 먹으므로 꼭 필요한 인스턴스에만 싣는다** — 트리거(상시광고, `0312`)는 앱이 `setServiceUuid`로 거르므로 필수이고, 24바이트짜리 명단에 넣으면 31바이트를 넘긴다.
-- **스캔도 `bluezero`를 안 쓴다.** `bluezero/adapter.py:304-317`의 `_interfaces_added`는 시그널에 이미 들어 있는 `ServiceData`를 버리고 주소로 `Device` 오브젝트를 다시 조회하는데, 폰들이 랜덤 MAC을 빠르게 바꾸는 환경에선 조회 전에 기기가 사라져 `ValueError: Cannot find a device`가 끊임없이 터진다. 그래서 시그널 payload에서 직접 읽는다.
-- **기동마다 rfkill을 풀고 bluetoothd를 능동적으로 재시작한다(`Ble.Adapter.prepare()`).** 실기(Pi 4)에서 `Powered` 설정이 `org.bluez.Error.Failed`로 거부되고, 이어진 `SetDiscoveryFilter`도 `org.bluez.Error.NotReady`로 실패해 BLE 스레드 전체가 죽는 문제가 있었다. 처음엔 `property_set_mode()`(`src/adapter.c:3116` 부근 — `mgmt_send()`가 큐잉에 실패하면 커널 응답도 없이 곧장 `.Failed`를 돌려주는 분기)를 근거로 "bluetoothd 내부 mgmt 연결이 깨졌다"고 추정했지만, **bluetoothd만 재시작해서는 재현이 그대로 반복돼 그 가설은 반증됐다.** 실제 원인은 **rfkill 소프트 블록**이었다 — `rfkill list`에서 hci0이 `Soft blocked: yes`, `hciconfig -a`에서 `hci0`이 `DOWN`으로 확인됐고, `rfkill unblock bluetooth` 후 `hciconfig hci0 up`이 곧바로 `UP RUNNING`으로 전환되는 것으로 재현·해소를 직접 확인했다. rfkill이 막고 있으면 bluetoothd를 몇 번 재시작해도 그 아래 인터페이스를 못 올리므로 기다려도 저절로 안 풀린다. 블루투스는 이 데몬 전용이라 언블록·재시작해도 방해받는 다른 프로세스가 없으므로, 상태를 확인하고 필요할 때만 조치하는 대신 **매 기동마다 무조건** rfkill 해제 + bluetoothd 재시작을 실행해 항상 같은 known-good 상태에서 시작한다. `door-lock-svc`에게 `rfkill unblock bluetooth`/`systemctl restart bluetooth` NOPASSWD sudo만 최소로 내준다(`/etc/sudoers.d/door-lock-bluetooth`, 두 setup 스크립트가 설치).
-- **광고 인스턴스는 `Type: "peripheral"`(connectable)로 등록한다 — `"broadcast"`가 아니다.** rfkill을 풀고
-  discovery까지 정상 시작된 뒤에도 `org.bluez.Error.Failed: Failed to register advertisement`가 났다.
-  `btmon` 캡처로 확정했다: `LE Set Advertising Data`는 성공하는데 곧바로 이어지는
-  `LE Set Random Address`가 `Command Disallowed (0x0c)`로 거부되어 `Add Extended Advertising Data`가
-  `Failed (0x03)`로 끝난다. 근거는 `mgmt-api.txt:3593`(Add Extended Advertising Parameters Command) —
-  *"When using non-connectable or scannable advertising, the controller will be programmed with a
-  non-resolvable random address. When the system is connectable, then the identity address ... will
-  be used."* `Type: "broadcast"`(non-connectable)를 쓰면 등록마다 새 NRPA를 요구하는데, 우리는 상시
-  스캔을 켜두고 있어 Bluetooth Core Spec Vol 4 Part E §7.8.4("스캐닝 중엔 `LE Set Random Address`
-  금지")에 걸려 매번 거부됐다. `advertising.c:937`(`get_adv_flags`)에서 `Type == "peripheral"`일 때만
-  `MGMT_ADV_FLAG_CONNECTABLE`이 켜지고, 그 경우 identity(고정 공개 MAC) 주소를 써서 이 명령 자체가
-  필요 없어진다. 프로토콜은 GATT 연결 없이 ServiceData 브로드캐스트만 쓰므로 `peripheral`로 바꿔도
-  폰 쪽 감지 로직에는 영향이 없다 — 광고 패킷이 `ADV_NONCONN_IND`에서 `ADV_IND`로, MAC이 랜덤에서
-  고정 공개 주소로 바뀔 뿐이다.
+- **광고 내용은 등록을 유지한 채 바꿀 수 있다.** bluetoothd는 등록된 광고 오브젝트의 속성을 감시하다가 변경 신호를 받으면 같은 인스턴스 번호로 컨트롤러에 새 데이터를 밀어넣는다. 그래서 광고는 기동 시 한 번만 등록하면 되고, 이후엔 내용만 갈아끼운다. 실어 보내는 데이터뿐 아니라 **송출 UUID 목록도 같은 방식으로 교체하거나 비울 수 있어**, 특정 광고를 해제하지 않고도 폰에 안 잡히게 만들 수 있다.
+- **`bluezero`로는 그게 불가능하다.** 속성을 바꿔도 변경 신호를 보내지 않아 내용 교체가 반영되지 않고, 송출 지속시간·간격에 해당하는 속성 자체가 없어 시점과 주기를 제어할 방법이 없다. 그래서 BlueZ D-Bus API를 직접 쓴다.
+- **광고 등록 요청은 블로킹으로 부를 수 없다.** bluetoothd는 등록을 처리하는 도중 **우리 프로세스로 되돌아 호출**해 광고 속성을 읽어가고, 그 응답을 받은 뒤에야 등록 결과를 준다. 블로킹으로 부르면 서로 상대의 응답을 기다리는 데드락이 되어 타임아웃으로 끝난다. 비동기로 걸고, 그동안 메인루프가 돌 수 있는 상태여야 한다. 되돌아 호출이 없는 요청(스캔 필터 설정, 스캔 시작, 전원 설정, 광고 해제)은 블로킹이어도 안전하다.
+- **등록이 타임아웃으로 실패해도 bluetoothd에는 등록이 남는다.** 그 뒤 같은 소유자·경로로 다시 등록하면 무조건 "이미 존재함"으로 거부되므로, 한 번 어긋나면 프로세스를 새로 띄우기 전에는 그 경로를 되살릴 수 없다. **그래서 등록 실패 시 재시도하지 않고 로그만 남긴다** — 재시도는 일시적 실패를 영구 장애로 만든다.
+- **다른 프로세스가 등록한 광고는 지울 수 없다.** 해제는 소유자와 경로가 모두 일치해야 한다. 기동 시 우리 경로만 정리하고, 남의 광고가 떠 있으면 로그로만 남긴다. 완전 초기화가 필요하면 bluetoothd를 재시작한다.
+- **동시 광고는 안 된다 — 커널이 교대로 내보낸다.** 이 하드웨어는 확장 광고를 지원하지 않아, 등록된 광고들을 소프트웨어 라운드로빈으로 시분할 송출한다. 지원 인스턴스 수는 "동시 N개"가 아니라 "로테이션 큐 N칸"이다. 각 광고의 송출 지속시간으로 airtime을 배분하는 이유가 이것이다.
+- **payload 한도는 24바이트다.** legacy 광고 31바이트에서 데이터 헤더와 BlueZ가 덧붙이는 몫을 뺀 값이다. Service UUID 목록을 함께 실으면 4바이트를 더 먹으므로 꼭 필요한 광고에만 싣는다 — 24바이트를 꽉 채우는 재실 명단에 넣으면 한도를 넘는다.
+- **스캔 결과는 시그널에 실려온 값을 그대로 읽어야 한다.** 주소로 기기를 다시 조회하는 방식은, 폰이 랜덤 MAC을 빠르게 바꾸는 환경에서 조회 전에 기기가 사라져 실패가 끝없이 반복된다.
+- **rfkill 소프트 블록이 걸려 있으면 어댑터를 켤 수 없다.** 이 상태에서는 전원 설정이 거부되고 뒤이은 스캔 설정도 실패해 BLE가 통째로 죽는다. bluetoothd를 몇 번 재시작해도 저절로 풀리지 않는다. 그래서 기동마다 rfkill을 먼저 풀고 bluetoothd를 재시작해 항상 같은 상태에서 시작한다. 블루투스는 이 데몬 전용이라 언블록·재시작이 다른 프로세스를 방해하지 않는다.
+- **광고는 connectable로 등록해야 한다.** non-connectable로 등록하면 커널이 등록할 때마다 새 임의 주소를 요구하는데, **스캔 중에는 임의 주소 설정이 금지**되어 있어(Bluetooth Core Spec Vol 4 Part E §7.8.4) 상시 스캔을 켜두는 이 구조에서는 광고 등록이 매번 거부된다. connectable이면 고정 공개 주소를 쓰므로 이 명령 자체가 필요 없어진다. GATT 연결 없이 브로드캐스트만 쓰므로 폰 쪽 감지에는 영향이 없다.
 
 ### 하드웨어: Pi 3B에서는 BT가 죽는다
 
