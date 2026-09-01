@@ -40,6 +40,81 @@ logger.addHandler(handler)
 
 _schedule_cache = []
 _schedule_lock = threading.Lock()
+_measurement_recorder = None
+_measurement_uploader = None
+
+
+def _start_ble_measurement() -> None:
+    """설정된 경우에만 BLE 측정 writer와 선택형 uploader를 시작한다."""
+    database_path = os.environ.get("BLE_MEASUREMENT_DB")
+    if not database_path:
+        return
+    hash_key = os.environ.get("BLE_MEASUREMENT_HASH_KEY")
+    if not hash_key:
+        logger.error("BLE_MEASUREMENT_DB is set but BLE_MEASUREMENT_HASH_KEY is missing")
+        return
+
+    from ble_measurement import (
+        BleMeasurementRecorder,
+        HttpSyncTransport,
+        MeasurementUploader,
+        SQLiteMeasurementStore,
+    )
+
+    global _measurement_recorder, _measurement_uploader
+    try:
+        pi_id = os.environ.get("BLE_MEASUREMENT_PI_ID", f"door-lock-pi-{ROOM_NUMBER}")
+        store = SQLiteMeasurementStore(database_path)
+        recorder = BleMeasurementRecorder(
+            store,
+            pi_id=pi_id,
+            hash_key=hash_key.encode("utf-8"),
+            logger=logger,
+        )
+        recorder.start()
+        _measurement_recorder = recorder
+
+        endpoint = os.environ.get("BLE_MEASUREMENT_ENDPOINT")
+        token = os.environ.get("BLE_MEASUREMENT_TOKEN")
+        if endpoint and token:
+            uploader = MeasurementUploader(
+                store,
+                pi_id=pi_id,
+                boot_id=recorder.boot_id,
+                transport=HttpSyncTransport(endpoint, token),
+                logger=logger,
+            )
+            uploader.start()
+            _measurement_uploader = uploader
+        elif endpoint:
+            logger.error("BLE_MEASUREMENT_ENDPOINT is set but BLE_MEASUREMENT_TOKEN is missing")
+        logger.info("ble measurement enabled database=%s pi_id=%s", database_path, pi_id)
+    except Exception as error:
+        logger.error("ble measurement initialization failed: %s", error)
+
+
+def _stop_ble_measurement() -> None:
+    if _measurement_uploader is not None:
+        _measurement_uploader.close()
+    if _measurement_recorder is not None:
+        _measurement_recorder.close()
+
+
+def _record_ble_measurement(raw_identifier: bytes, packet_kind: str, rssi: Optional[int]) -> None:
+    """측정 실패가 도어락의 기존 BLE 처리를 중단하지 않도록 격리한다."""
+    recorder = _measurement_recorder
+    if recorder is None:
+        return
+    try:
+        recorder.observe(
+            raw_identifier=raw_identifier,
+            packet_kind=packet_kind,
+            service_uuid=Ble.Payload.uuid16_to_str(Ble.UUID_REGISTER),
+            rssi=rssi,
+            pi_phase="continuous",
+        )
+    except Exception:
+        logger.exception("ble measurement callback failed")
 
 
 def _parse_iso(s):
@@ -378,6 +453,14 @@ class Ble:
                         info["last_heartbeat_at"] = time.monotonic()
                         info["visible"] = visible
                         return
+
+        def student_id_for_token(self, random_id: int) -> Optional[str]:
+            """등록된 세션토큰을 측정용 학번 식별자로 역매핑한다."""
+            with self._lock:
+                for student_id, info in self._registered_devices.items():
+                    if info["random_id"] == random_id:
+                        return student_id
+            return None
 
         def add_candidate(self, student_id: str, rssi: int, visible: bool) -> None:
             """1초 배치 윈도우에 등록 후보를 쌓는다. 같은 폰이 여러 번 보내면 최신 것으로
@@ -1009,6 +1092,13 @@ class Ble:
         heartbeat = Ble.Payload.parse_heartbeat_payload(payload)
         if heartbeat is not None:
             random_id, visible = heartbeat
+            student_id = self.registry.student_id_for_token(random_id)
+            raw_identifier = (
+                student_id.encode("ascii")
+                if student_id is not None
+                else b"heartbeat-token:" + bytes([random_id])
+            )
+            _record_ble_measurement(raw_identifier, "heartbeat", rssi)
             self.registry.touch_heartbeat(random_id, visible)
             return
 
@@ -1019,6 +1109,7 @@ class Ble:
             return
 
         student_id, visible = registration
+        _record_ble_measurement(student_id.encode("ascii"), "register", rssi)
         self.registry.add_candidate(student_id, rssi, visible)
 
     def _proximity_scan_loop(self) -> None:
@@ -1241,6 +1332,7 @@ def unlock():
 
 def _shutdown_ble(*_args) -> None:
     _ble.shutdown()
+    _stop_ble_measurement()
 
 
 def _handle_shutdown_signal(signum, frame):
@@ -1262,5 +1354,6 @@ if __name__ == "__main__":
         t.daemon = True
         t.start()
         logger.info("schedules cache valid, next refresh in %.0fs", SCHEDULE_REFRESH_INTERVAL - elapsed)
+    _start_ble_measurement()
     start_reader()
     app.run(host="127.0.0.1", port=PORT, threaded=True)
