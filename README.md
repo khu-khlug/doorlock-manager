@@ -61,7 +61,7 @@ some-dir/
 ├── start-door-lock.sh    # 2. 부팅마다: X 세션 시작 + Chromium 키오스크 실행
 ├── stop-door-lock.sh     # 3. 필요 시: 모든 프로세스 정지
 ├── door-lock-daemon.py   # 4. 데몬: Flask HTTP 서버 + GPIO/BLE 제어 (systemd 관리)
-└── ble_measurement.py    # 선택형 RSSI 저장소·run/CSV CLI·batch uploader
+└── ble_measurement.py    # 선택형 RSSI 저장소·CSV export·batch uploader
 ```
 
 ### 1. `setup-door-lock.sh` — 최초 설치
@@ -179,7 +179,7 @@ Pi는 트리거로 수집 창을 열고 닫지 않고 **항상 스캔한다.**
 
 이 기능은 `experiment/ble-rssi-measurement` 장기 실험 브랜치에서 관리하며 `main` merge나 운영 배포를 전제하지 않는다. 실제 Pi에서 거리 판정용 원시 RSSI를 모으고 선택적으로 측정 서버와 동기화하기 위한 기능이다. 환경변수를 설정하지 않으면 기존 도어락 동작에 관여하지 않는다.
 
-systemd drop-in에 아래 두 환경변수를 설정하면 데몬이 `1111` 등록 요청과 하트비트의 RSSI를 SQLite에 비동기로 기록한다. run은 기록을 켜고 끄는 스위치가 아니라 실험 구간에 붙는 nullable label이다. `BLE_MEASUREMENT_HASH_KEY`는 학번 원문 대신 같은 시험 기기를 구분하는 가명 tag를 만들 때 사용하므로 실험 중에는 바꾸지 않는다.
+systemd drop-in에 아래 두 환경변수를 설정하면 데몬이 `1111` 등록 요청과 하트비트의 RSSI를 SQLite에 비동기로 기록한다. `BLE_MEASUREMENT_HASH_KEY`는 학번 원문 대신 같은 시험 기기를 구분하는 가명 tag를 만들 때 사용하므로 실험 중에는 바꾸지 않는다.
 
 ```ini
 [Service]
@@ -187,17 +187,17 @@ Environment=BLE_MEASUREMENT_DB=/var/cache/door-lock/ble-measurement.sqlite3
 Environment=BLE_MEASUREMENT_HASH_KEY=실험용-비밀값
 ```
 
-재시작 후 `status`에서 최근 가명 tag를 확인한다. 서버를 사용하지 않는 실험에서는 CLI로 run을 시작·종료하고 CSV를 export할 수 있다. DB는 `door-lock-svc` 소유이므로 CLI도 같은 사용자로 실행한다.
+재시작 후 `status`에서 최근 가명 tag를 확인하고 CSV를 export할 수 있다. Pi는 run 상태를 갖지 않고 원시 관측만 계속 기록한다. 실험 구간과 조건은 측정 서버가 관측 시각으로 관리하므로 서버를 사용하지 않을 때는 원시 SQLite와 CSV만 남는다. DB는 `door-lock-svc` 소유이므로 CLI도 같은 사용자로 실행한다.
 
 ```bash
 sudo systemctl restart door-lock-daemon
 sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 status
-sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 run start --expected allow --target TAG --position outside-0.5m --carrying hand --orientation facing-pi
-sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 run stop
 sudo -u door-lock-svc python3 /home/kiosk/ble_measurement.py --db /var/cache/door-lock/ble-measurement.sqlite3 export --output /var/cache/door-lock/ble-measurement.csv
 ```
 
-`BLE_MEASUREMENT_ENDPOINT`와 `BLE_MEASUREMENT_TOKEN`을 모두 설정하면 `/api/v1/pi/sync`로 outbound 동기화한다. observation과 run revision은 서버가 ACK할 때까지 로컬에 보존하며 실패 시 재시도한다.
+`BLE_MEASUREMENT_ENDPOINT`와 `BLE_MEASUREMENT_TOKEN`을 모두 설정하면 schema v2 `/api/v1/pi/sync`로 outbound 동기화한다. Pi는 원시 observation을 보내고 서버가 ACK한 event만 업로드 완료로 표시한다. 서버 응답으로 Pi 상태를 바꾸는 경로는 없다.
+
+run label을 저장하던 이전 버전의 측정 DB는 schema v2에서 재사용하지 않는다. 해당 DB가 있으면 데몬 로그에 `LegacyDatabaseError`를 남기고 측정을 시작하지 않는다. 필요한 원본은 이전 버전 도구로 export한 뒤 새 DB 경로를 사용하거나 기존 파일을 제거한다.
 
 이 브랜치의 설치 파일을 내려받을 때만 최초 실행한 setup script에 ref를 지정한다. 기본값은 계속 `main`이다.
 
