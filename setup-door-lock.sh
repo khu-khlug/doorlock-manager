@@ -235,17 +235,18 @@ echo "  .xinitrc configured"
 
 # ── 9. Display sleep cron ─────────────────────────────────────────────────────
 echo "[9/13] Registering display sleep cron..."
-CRON_MARK="# door-lock: display power"
-if ! sudo crontab -u "$KIOSK_USER" -l 2>/dev/null | grep -qF "$CRON_MARK"; then
-    (sudo crontab -u "$KIOSK_USER" -l 2>/dev/null; \
-     echo "$CRON_MARK"; \
-     echo "0 9  * * * DISPLAY=:0 xset s off; DISPLAY=:0 xset -dpms"; \
-     echo "0 21 * * * DISPLAY=:0 xset s 300 300; DISPLAY=:0 xset dpms 300 300 300") \
-    | sudo crontab -u "$KIOSK_USER" -
-    echo "  Cron registered (sleep off at 09:00 / sleep on at 21:00)"
-else
-    echo "  Cron already registered, skipping"
-fi
+# 절전 전환 시각은 /etc/cron.d 드롭인으로 관리한다. 덮어쓰기만 하므로 여러 번 실행해도
+# 항상 이 내용으로 맞춰지고, 시각을 바꾸면 이미 설치된 기기에도 그대로 반영된다.
+# xset은 cron 환경에서도 ~/.Xauthority로 X에 붙으므로 DISPLAY만 지정하면 된다.
+sudo tee /etc/cron.d/door-lock-display > /dev/null << EOF
+# door-lock: display power
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+0 9  * * * ${KIOSK_USER} DISPLAY=:0 xset s off; DISPLAY=:0 xset -dpms
+0 21 * * * ${KIOSK_USER} DISPLAY=:0 xset s 300 300; DISPLAY=:0 xset dpms 300 300 300
+EOF
+sudo chmod 644 /etc/cron.d/door-lock-display
+echo "  Cron registered (sleep off at 09:00 / sleep on at 21:00)"
 
 # ── 10. Grant bluetooth setup permissions ──────────────────────────────────────
 echo "[10/13] Granting bluetooth setup permissions to ${DAEMON_SVC_USER}..."
