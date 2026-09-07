@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request, make_response
 from gpiozero import OutputDevice
 import atexit
+import math
 import requests
 import signal
 import subprocess
@@ -367,7 +368,7 @@ class Ble:
         def __init__(self):
             self._lock = threading.Lock()
             self._registered_devices = {}  # 학번 -> {"random_id", "last_heartbeat_at", "visible"}
-            self._candidates = {}          # 1초 배치 동안 쌓인 최신 후보. 학번 -> {...}
+            self._candidates = {}          # 학번별 최대 5초 RSSI 관측열. 학번 -> {...}
             self._random_id_counter = Ble.RANDOM_ID_MIN  # 다음에 발급할 세션토큰. 항상 비어있는 값을 가리킨다.
 
         def touch_heartbeat(self, random_id: int, visible: bool) -> None:
@@ -380,29 +381,43 @@ class Ble:
                         return
 
         def add_candidate(self, student_id: str, rssi: int, visible: bool) -> None:
-            """1초 배치 윈도우에 등록 후보를 쌓는다. 같은 폰이 여러 번 보내면 최신 것으로
-            덮어쓴다.
+            """등록 후보의 RSSI 관측열을 쌓는다.
 
             이미 등록된 기기인지는 여기서 거르지 않고 꺼낼 때 거른다
-            (snapshot_and_clear_candidates 참고) — 이유는 그쪽 주석에 있다."""
+            (snapshot_candidates 참고) — 이유는 그쪽 주석에 있다. 1초 넘게 신호가
+            끊기거나 5초 판정 기한이 지난 뒤 다시 들어오면 새 관측 구간으로 시작한다."""
+            now = time.monotonic()
             with self._lock:
-                if student_id not in self._candidates and student_id not in self._registered_devices:
+                candidate = self._candidates.get(student_id)
+                starts_new_episode = (
+                    candidate is None
+                    or now - candidate["last_seen_at"] > CANDIDATE_CONTINUITY_GAP_SECONDS
+                    or now - candidate["first_seen_at"] > CANDIDATE_EVIDENCE_DEADLINE_SECONDS
+                )
+                if starts_new_episode:
+                    candidate = {
+                        "student_id": student_id,
+                        "first_seen_at": now,
+                        "last_seen_at": now,
+                        "visible": visible,
+                        "observations": [],
+                    }
+                    self._candidates[student_id] = candidate
+
+                if starts_new_episode and student_id not in self._registered_devices:
                     # 폰은 초당 여러 번 같은 신호를 보낸다. 매번 찍으면 24시간 운용에서
                     # 로그가 폭주하니 처음 한 번만 남긴다. 등록을 마친 기기가 확인 광고를
                     # 놓쳐 등록 요청을 계속 보내는 경우도 로그에서 제외한다.
                     logger.info("ble candidate added student_id=%s rssi=%d visible=%s", student_id, rssi, visible)
-                self._candidates[student_id] = {
-                    "student_id": student_id,
-                    "rssi": rssi,
-                    "seen_at": time.monotonic(),
-                    "visible": visible,
-                }
+                candidate["last_seen_at"] = now
+                candidate["visible"] = visible
+                candidate["observations"].append((now, rssi))
 
-        def snapshot_and_clear_candidates(self) -> list:
-            """직전 1초 동안 쌓인 후보를 꺼내고 비운다. **이미 등록된 기기는 여기서 제외한다.**
+        def snapshot_candidates(self, now: Optional[float] = None) -> list:
+            """판정 기한 안의 후보 상태를 복사한다. **이미 등록된 기기는 여기서 제외한다.**
 
-            거르는 시점이 꺼낼 때인 이유: 후보로 들어간 뒤 실제로 인증되기까지 최대 1초(배치
-            주기) + 백엔드 왕복 시간이 걸린다. 넣을 때만 검사하면 그 사이에 등록이 끝난 기기가
+            거르는 시점이 꺼낼 때인 이유: 후보로 들어간 뒤 실제로 인증되기까지 판정 시간 +
+            백엔드 왕복 시간이 걸린다. 넣을 때만 검사하면 그 사이에 등록이 끝난 기기가
             다음 배치에 그대로 남아 재인증되고, 문이 다시 열리면서 세션토큰까지 새로 발급된다
             (폰은 먼저 받은 토큰을 들고 있는데 재실 명단에는 새 토큰이 실려 서로 어긋난다).
             꺼내는 시점에 확인하면 등록 직후의 잔여 후보가 전부 걸러진다.
@@ -410,13 +425,28 @@ class Ble:
             _registered_devices와 _candidates를 같은 락 안에서 함께 보므로, register()가
             중간에 끼어들어 생기는 경합은 없다.
             """
+            if now is None:
+                now = time.monotonic()
             with self._lock:
-                candidates = [
-                    info for student_id, info in self._candidates.items()
-                    if student_id not in self._registered_devices
+                stale = [
+                    student_id for student_id, info in self._candidates.items()
+                    if student_id in self._registered_devices
+                    or now - info["first_seen_at"] > CANDIDATE_EVIDENCE_DEADLINE_SECONDS
                 ]
-                self._candidates.clear()
+                for student_id in stale:
+                    del self._candidates[student_id]
+
+                candidates = []
+                for info in self._candidates.values():
+                    snapshot = dict(info)
+                    snapshot["observations"] = tuple(info["observations"])
+                    candidates.append(snapshot)
             return candidates
+
+        def remove_candidate(self, student_id: str) -> None:
+            """인증 대상으로 꺼낸 후보를 제거한다. 다른 후보의 관측열은 보존한다."""
+            with self._lock:
+                self._candidates.pop(student_id, None)
 
         def _next_random_id(self, value: int) -> int:
             """세션토큰 순환. RANDOM_ID_MIN..RANDOM_ID_MAX 안에서만 돈다."""
@@ -1022,17 +1052,19 @@ class Ble:
         self.registry.add_candidate(student_id, rssi, visible)
 
     def _proximity_scan_loop(self) -> None:
-        """1초마다 그 사이 쌓인 후보를 모아 범위 내 가장 가까운 하나를 인증한다.
+        """1초마다 누적 후보 중 개방 범위에 있는 한 명을 인증한다.
         threading.Timer로 스스로 재예약한다 — 이 환경에서 GLib.timeout_add는
         최초 1회 이후 반복 실행되지 않는 것으로 실기에서 확인됐다 (README 참고)."""
         try:
-            candidates = self.registry.snapshot_and_clear_candidates()
-            # 정원이 찼으면 후보를 비우기만 하고 판정도 인증도 하지 않는다. 정원이 찬 동안엔
+            now = time.monotonic()
+            candidates = self.registry.snapshot_candidates(now)
+            # 정원이 찼으면 판정도 인증도 하지 않는다. 정원이 찬 동안엔
             # 0312를 안 내보내므로 후보가 새로 쌓일 일도 거의 없지만, 정원이 차기 직전에
-            # 들어온 신호가 남아 있을 수 있다.
+            # 들어온 신호가 판정 기한까지 남아 있을 수 있다.
             if self.registry.has_capacity():
-                candidate = select_closest_candidate_in_range(candidates)
+                candidate = select_next_eligible_candidate(candidates, now)
                 if candidate is not None:
+                    self.registry.remove_candidate(candidate["student_id"])
                     self._confirm_candidate(candidate)
         except Exception:
             logger.exception("ble proximity scan error")
@@ -1135,21 +1167,93 @@ class Ble:
 
 Ble._load_uuids_from_file()
 
-# 근접 판정 임계값. 판별 알고리즘을 갈아끼우는 자리라 Ble 클래스 상수로 두지 않고
-# 모듈 최상위에 둔다 — 클래스 구조를 몰라도 바로 찾아 고칠 수 있어야 한다.
-BLE_PROXIMITY_RSSI_THRESHOLD = -60  # dBm
+# 실측에서 고정한 개방 범위 판정 기준. RSSI를 거리로 환산하지 않고, 한 기기의 짧은
+# 관측열이 문 앞 허용 조건을 충분히 지속해서 만족했는지만 판단한다.
+CANDIDATE_EVIDENCE_DEADLINE_SECONDS = 5
+CANDIDATE_CONTINUITY_GAP_SECONDS = 1
+CANDIDATE_MIN_OBSERVATION_SPAN_SECONDS = 2
+CANDIDATE_MIN_OCCUPIED_BINS = 3
+CANDIDATE_MIN_RSSI_Q10_DBM = -70
+CANDIDATE_STRONG_RSSI_DBM = -60
+CANDIDATE_MIN_STRONG_RATIO = 0.5
 
 
-def select_closest_candidate_in_range(candidates: list) -> Optional[dict]:
-    """1초간 모인 후보 중 임계 거리(신호 세기) 이내에서 가장 가까운 것 하나를 고른다.
-    범위 안에 아무도 없으면 None.
+def _quantile(values: list, probability: float) -> float:
+    """선형 보간 quantile. 실측 replay와 같은 계산식을 사용한다."""
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
-    RSSI가 BLE_PROXIMITY_RSSI_THRESHOLD 이상인 후보만 남기고 그중 최댓값을 고른다.
-    """
-    in_range = [c for c in candidates if c["rssi"] >= BLE_PROXIMITY_RSSI_THRESHOLD]
-    if not in_range:
+
+def _candidate_eligible_since(candidate: dict, now: float) -> Optional[float]:
+    observations = candidate.get("observations", ())
+    if not observations:
         return None
-    return max(in_range, key=lambda c: c["rssi"])
+
+    first_seen_at = candidate["first_seen_at"]
+    last_seen_at = observations[-1][0]
+    if now - first_seen_at > CANDIDATE_EVIDENCE_DEADLINE_SECONDS:
+        return None
+    if now - last_seen_at >= CANDIDATE_CONTINUITY_GAP_SECONDS:
+        return None
+
+    for end in range(CANDIDATE_MIN_OCCUPIED_BINS - 1, len(observations)):
+        prefix = observations[:end + 1]
+        span = prefix[-1][0] - prefix[0][0]
+        if span < CANDIDATE_MIN_OBSERVATION_SPAN_SECONDS:
+            continue
+
+        occupied_bins = {
+            min(
+                CANDIDATE_EVIDENCE_DEADLINE_SECONDS - 1,
+                int(observed_at - first_seen_at),
+            )
+            for observed_at, _rssi in prefix
+        }
+        if len(occupied_bins) < CANDIDATE_MIN_OCCUPIED_BINS:
+            continue
+
+        rssi_values = [rssi for _observed_at, rssi in prefix]
+        if _quantile(rssi_values, 0.1) < CANDIDATE_MIN_RSSI_Q10_DBM:
+            continue
+        strong_ratio = sum(
+            rssi >= CANDIDATE_STRONG_RSSI_DBM for rssi in rssi_values
+        ) / len(rssi_values)
+        if strong_ratio >= CANDIDATE_MIN_STRONG_RATIO:
+            return prefix[-1][0]
+
+    return None
+
+
+def is_candidate_eligible(candidate: dict, now: Optional[float] = None) -> bool:
+    """후보의 RSSI 관측열이 문 앞 개방 범위 기준을 충족하는지 반환한다."""
+    if now is None:
+        now = time.monotonic()
+    return _candidate_eligible_since(candidate, now) is not None
+
+
+def select_next_eligible_candidate(
+    candidates: list, now: Optional[float] = None
+) -> Optional[dict]:
+    """개방 적격 후보 중 먼저 조건을 충족한 한 명을 반환한다."""
+    if now is None:
+        now = time.monotonic()
+    eligible = [
+        candidate for candidate in candidates
+        if is_candidate_eligible(candidate, now)
+    ]
+    if not eligible:
+        return None
+    return min(
+        eligible,
+        key=lambda candidate: (
+            _candidate_eligible_since(candidate, now),
+            candidate["first_seen_at"],
+            candidate["student_id"],
+        ),
+    )
 
 
 _ble = Ble()
