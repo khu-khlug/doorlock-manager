@@ -21,6 +21,7 @@ LOG_FILE = "/var/log/door-lock/daemon.log"
 SCHEDULE_CACHE_FILE = "/var/cache/door-lock/schedules.json"
 SCHEDULE_REFRESH_INTERVAL = 3600  # 1시간
 SCHEDULE_RETRY_INTERVAL = 600    # 실패 시 10분 후 재시도
+OCCUPANTS_PUSH_INTERVAL_SECONDS = 60  # 재실 공개 명단을 백엔드에 올리는 주기
 
 with open("/etc/door-lock/api-key") as f:
     INTERNAL_API_KEY = f.read().strip()
@@ -132,17 +133,39 @@ def request_backend_authorization(endpoint: str, payload: dict) -> BackendResult
     return BackendResult(kind, resp.status_code, body)
 
 
-def attempt_unlock(endpoint: str, payload: dict, source: str) -> BackendResult:
-    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 블루투스 인증 로직이 공통으로 호출한다."""
+def attempt_unlock(endpoint: str, payload: dict, source: str, open_relay: bool = True) -> BackendResult:
+    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 블루투스 인증 로직이 공통으로 호출한다.
+
+    open_relay=False면 인증 시퀀스는 동일하게 진행하되 릴레이만 작동시키지 않는다 — 데몬
+    기동 직후 유예 기간에 재실 상태만 복구하고 문은 열지 않을 때 쓴다."""
     result = request_backend_authorization(endpoint, payload)
     if result.kind == "ok":
-        relay.on()
-        time.sleep(UNLOCK_DURATION)
-        relay.off()
-        logger.info("unlocked source=%s name=%s", source, result.body.get("name"))
+        if open_relay:
+            relay.on()
+            time.sleep(UNLOCK_DURATION)
+            relay.off()
+            logger.info("unlocked source=%s name=%s", source, result.body.get("name"))
+        else:
+            logger.info("authorized (relay suppressed) source=%s name=%s", source, result.body.get("name"))
     else:
         logger.info("denied source=%s kind=%s status=%s", source, result.kind, result.status_code)
     return result
+
+
+def _push_occupants(student_ids: list) -> None:
+    """공개 재실자 학번 목록을 백엔드에 snapshot 통째로 교체 방식으로 올린다.
+    실패해도 재시도 큐를 두지 않는다 — 다음 주기가 곧 재시도다."""
+    try:
+        resp = requests.put(
+            f"{BACKEND_URL}/occupants",
+            json={"occupants": student_ids},
+            headers={"Authorization": f"Bearer {INTERNAL_API_KEY}"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            logger.warning("occupants push failed status=%d", resp.status_code)
+    except requests.exceptions.RequestException as e:
+        logger.error("occupants push error: %s", e)
 
 
 def _log_callback_exceptions(default_return):
@@ -229,6 +252,14 @@ class Ble:
     # 듀티)라 명단 창이 1초일 때 실기에서 수신 간격이 15~20초까지 벌어지는 게 관측됐다.
     # 2초로 늘려 창 안에 포함되는 폰의 스캔 사이클 수를 늘린다.
     ROSTER_DURATION_SECONDS = 2
+
+    # 데몬 기동 후 이 시간 동안은 BLE 인증에 성공해도 릴레이를 열지 않고 등록만 한다.
+    # 재부팅 동안 안에 있던 사람은 세션이 끊겨 다시 진입 신호를 보내는데, 이걸 그냥
+    # 열어버리면 아무도 문 앞에 없어도 문이 열린다. 이 유예 기간 중엔 재등록으로만
+    # 처리해 재실 리스트를 복구한다. 같은 창에서 실제로 처음 들어오려는 사람도 문이 안
+    # 열리는 게 부작용인데, 재부팅 자체가 드물고 그 직후 1분 안에 신규 진입이 겹칠
+    # 확률은 더 낮다고 보고 감수한다 — 그 경우엔 키패드로 우회한다.
+    STARTUP_GRACE_SECONDS = 60
     # 인증 성공 후 확인 내용을 유지하는 시간(우리 타이머, BlueZ Timeout 아님).
     # bluetoothd는 속성 변경을 그 인스턴스의 다음 차례에 반영하므로, 슬롯 A의 airtime이 막
     # 시작한 직후에 인증이 끝나면 남은 5초 + 명단 2초를 기다려야 확인이 나가기 시작한다.
@@ -491,6 +522,11 @@ class Ble:
             """현재 등록된 세션토큰 전체 목록 (명단 광고 갱신용)."""
             with self._lock:
                 return [info["random_id"] for info in self._registered_devices.values()]
+
+        def visible_student_ids(self) -> list:
+            """공개(visible)로 등록된 재실자 학번 목록. PUT /occupants 전송용."""
+            with self._lock:
+                return [sid for sid, info in self._registered_devices.items() if info["visible"]]
 
         def log_table(self) -> None:
             """재실 인원 테이블(학번 -> 세션토큰)이 바뀔 때마다 전체 스냅샷을 남긴다."""
@@ -1008,6 +1044,10 @@ class Ble:
         self.registry = Ble.Registry()
         self.advertising = Ble.Advertising()
         self.adapter = Ble.Adapter()
+        self._started_at = time.monotonic()
+
+    def _within_startup_grace(self) -> bool:
+        return time.monotonic() - self._started_at < Ble.STARTUP_GRACE_SECONDS
 
     def _on_register_signal(self, payload: bytes, rssi: int) -> None:
         """폰이 보낸 REGISTER 신호 1건을 파싱해 Registry에 위임한다.
@@ -1066,6 +1106,7 @@ class Ble:
             "/internal/door-lock/accesses",
             {"number": int(student_id), "roomNumber": ROOM_NUMBER},
             source="bluetooth",
+            open_relay=not self._within_startup_grace(),
         )
         if result.kind != "ok":
             return
@@ -1101,6 +1142,16 @@ class Ble:
         t.daemon = True
         t.start()
 
+    def _occupants_push_loop(self) -> None:
+        """공개 재실자 목록을 주기적으로 백엔드에 올린다. threading.Timer로 스스로 재예약한다."""
+        try:
+            _push_occupants(self.registry.visible_student_ids())
+        except Exception:
+            logger.exception("occupants push loop error")
+        t = threading.Timer(OCCUPANTS_PUSH_INTERVAL_SECONDS, self._occupants_push_loop)
+        t.daemon = True
+        t.start()
+
     def start(self) -> None:
         """BLE 전용 스레드 진입점. 어댑터를 연결하고 광고를 등록한 뒤 메인루프를 돌린다."""
         self.adapter.prepare()
@@ -1113,7 +1164,7 @@ class Ble:
         # 근접 스캔/만료 정리는 GLib.timeout_add 대신 threading.Timer 기반 자기재예약
         # 루프로 돌린다 — 이 환경에서 GLib.timeout_add는 최초 1회 이후 반복 실행되지
         # 않는 것으로 실기에서 확인됐다 (README 참고).
-        for loop_fn in (self._proximity_scan_loop, self._reap_loop):
+        for loop_fn in (self._proximity_scan_loop, self._reap_loop, self._occupants_push_loop):
             t = threading.Timer(0.5, loop_fn)
             t.daemon = True
             t.start()
