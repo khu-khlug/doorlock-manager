@@ -22,6 +22,7 @@ LOG_FILE = "/var/log/door-lock/daemon.log"
 SCHEDULE_CACHE_FILE = "/var/cache/door-lock/schedules.json"
 SCHEDULE_REFRESH_INTERVAL = 3600  # 1시간
 SCHEDULE_RETRY_INTERVAL = 600    # 실패 시 10분 후 재시도
+OCCUPANTS_PUSH_INTERVAL_SECONDS = 60  # 재실 공개 명단을 백엔드에 올리는 주기
 
 with open("/etc/door-lock/api-key") as f:
     INTERNAL_API_KEY = f.read().strip()
@@ -133,17 +134,39 @@ def request_backend_authorization(endpoint: str, payload: dict) -> BackendResult
     return BackendResult(kind, resp.status_code, body)
 
 
-def attempt_unlock(endpoint: str, payload: dict, source: str) -> BackendResult:
-    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 블루투스 인증 로직이 공통으로 호출한다."""
+def attempt_unlock(endpoint: str, payload: dict, source: str, open_relay: bool = True) -> BackendResult:
+    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 블루투스 인증 로직이 공통으로 호출한다.
+
+    open_relay=False면 인증 시퀀스는 동일하게 진행하되 릴레이만 작동시키지 않는다 — 데몬
+    기동 직후 유예 기간에 재실 상태만 복구하고 문은 열지 않을 때 쓴다."""
     result = request_backend_authorization(endpoint, payload)
     if result.kind == "ok":
-        relay.on()
-        time.sleep(UNLOCK_DURATION)
-        relay.off()
-        logger.info("unlocked source=%s name=%s", source, result.body.get("name"))
+        if open_relay:
+            relay.on()
+            time.sleep(UNLOCK_DURATION)
+            relay.off()
+            logger.info("unlocked source=%s name=%s", source, result.body.get("name"))
+        else:
+            logger.info("authorized (relay suppressed) source=%s name=%s", source, result.body.get("name"))
     else:
         logger.info("denied source=%s kind=%s status=%s", source, result.kind, result.status_code)
     return result
+
+
+def _push_occupants(student_ids: list) -> None:
+    """공개 재실자 학번 목록을 백엔드에 snapshot 통째로 교체 방식으로 올린다.
+    실패해도 재시도 큐를 두지 않는다 — 다음 주기가 곧 재시도다."""
+    try:
+        resp = requests.put(
+            f"{BACKEND_URL}/occupants",
+            json={"occupants": student_ids},
+            headers={"Authorization": f"Bearer {INTERNAL_API_KEY}"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            logger.warning("occupants push failed status=%d", resp.status_code)
+    except requests.exceptions.RequestException as e:
+        logger.error("occupants push error: %s", e)
 
 
 def _log_callback_exceptions(default_return):
@@ -220,19 +243,30 @@ class Ble:
     # round-robin으로 교대 송출하며, Duration이 각 인스턴스의 1회 airtime이다
     # (org.bluez.LEAdvertisement.rst의 Duration = "Rotation duration"). Duration 변경 자체는
     # 거의 공짜다(비확장 광고 컨트롤러에서는 커널이 구조체 값만 갱신하고 HCI 왕복도 없다 —
-    # net/bluetooth/hci_core.c의 hci_add_adv_instance 참고). 진짜 병목은 "그 채널의 로테이션
-    # 순번이 돌아오기까지의 대기 시간"뿐이라, 평소엔 세 채널을 균등하게 짧은 주기로 돌려
-    # 전체 로테이션을 최대한 짧게 유지한다.
-    TRIGGER_DURATION_SECONDS = 1   # 상시광고/명단/확인 균등 1초씩 -> 평소 로테이션 주기 3초
-    ROSTER_DURATION_SECONDS = 1
-    CONFIRM_DURATION_SECONDS = 1   # 확인의 평소(비활성) Duration
-    CONFIRM_ACTIVE_DURATION_SECONDS = 5  # 인증 성공 시 이 값으로 잠깐 키운다 (아래 참고)
-    CONFIRM_CONTENT_SECONDS = 5    # 인증 성공 후 실제 내용을 보여주는 시간(우리 타이머, BlueZ Timeout 아님).
-    # 이 두 값을 같게 잡은 이유: 활성 상태의 로테이션 주기는 1+1+5=7초이고, 확인 채널
-    # 자신의 airtime은 그 7초 중 5초를 통째로 차지하는 한 덩어리라 폰이 놓칠 일이 사실상
-    # 없다. 순번을 막 놓친 최악의 경우에도 트리거+명단(최대 2초)만 기다리면 확인 채널
-    # 차례가 오므로, 앱의 10초 하드 타임아웃(BleRelayService.kt의 openConfirmationTimeoutMillis)
-    # 대비 여유가 충분하다.
+    # net/bluetooth/hci_core.c의 hci_add_adv_instance 참고). 진짜 병목은 "그 슬롯의 로테이션
+    # 순번이 돌아오기까지의 대기 시간"뿐이다.
+    # 슬롯은 둘뿐이다. 진입 신호와 확인 신호는 시간상 배타적이라 — 확인을 보내는 시점엔
+    # 그 사람의 인증이 이미 끝나 진입 신호가 필요 없다 — 한 슬롯을 UUID만 바꿔가며 함께
+    # 쓴다. 슬롯이 줄어든 만큼 진입 신호 airtime이 로테이션의 대부분을 차지한다.
+    SIGNAL_DURATION_SECONDS = 5    # 슬롯 A: 진입 신호(0312) / 확인(2222)
+    # 슬롯 B: 재실 명단(3333). 폰의 재실 스캔은 BALANCED 모드(183ms 켜짐/730ms 주기, 25%
+    # 듀티)라 명단 창이 1초일 때 실기에서 수신 간격이 15~20초까지 벌어지는 게 관측됐다.
+    # 2초로 늘려 창 안에 포함되는 폰의 스캔 사이클 수를 늘린다.
+    ROSTER_DURATION_SECONDS = 2
+
+    # 데몬 기동 후 이 시간 동안은 BLE 인증에 성공해도 릴레이를 열지 않고 등록만 한다.
+    # 재부팅 동안 안에 있던 사람은 세션이 끊겨 다시 진입 신호를 보내는데, 이걸 그냥
+    # 열어버리면 아무도 문 앞에 없어도 문이 열린다. 이 유예 기간 중엔 재등록으로만
+    # 처리해 재실 리스트를 복구한다. 같은 창에서 실제로 처음 들어오려는 사람도 문이 안
+    # 열리는 게 부작용인데, 재부팅 자체가 드물고 그 직후 1분 안에 신규 진입이 겹칠
+    # 확률은 더 낮다고 보고 감수한다 — 그 경우엔 키패드로 우회한다.
+    STARTUP_GRACE_SECONDS = 60
+    # 인증 성공 후 확인 내용을 유지하는 시간(우리 타이머, BlueZ Timeout 아님).
+    # bluetoothd는 속성 변경을 그 인스턴스의 다음 차례에 반영하므로, 슬롯 A의 airtime이 막
+    # 시작한 직후에 인증이 끝나면 남은 5초 + 명단 2초를 기다려야 확인이 나가기 시작한다.
+    # 한 로테이션(7초)보다 길게 잡아, 어느 시점에 전환되든 확인이 최소 한 번은 5초를 온전히
+    # 채우게 한다. 앱의 확인 대기 한도는 10초다(BleRelayService.kt의 openConfirmationTimeoutMillis).
+    CONFIRM_CONTENT_SECONDS = 8
     # 광고 반복 간격. 짧게 잡을수록 폰이 짧은 스캔 창 안에서도 광고를 받을 확률이 높아진다.
     ADV_MIN_INTERVAL_MS = 100
     ADV_MAX_INTERVAL_MS = 200
@@ -249,10 +283,9 @@ class Ble:
     OBJECT_MANAGER_IFACE = "org.freedesktop.DBus.ObjectManager"
     # 어댑터 경로는 자동 탐색하며, BLE_ADAPTER 환경변수로 재정의할 수 있다.
     ADAPTER_PATH_OVERRIDE = os.environ.get("BLE_ADAPTER")
-    # 광고 인스턴스 3개의 D-Bus 오브젝트 경로.
-    AD_PATH_TRIGGER = "/org/khlug/doorlock/advertisement0"
+    # 광고 인스턴스 2개의 D-Bus 오브젝트 경로.
+    AD_PATH_SIGNAL = "/org/khlug/doorlock/advertisement0"
     AD_PATH_ROSTER = "/org/khlug/doorlock/advertisement1"
-    AD_PATH_CONFIRM = "/org/khlug/doorlock/advertisement2"
 
     @classmethod
     def _load_uuids_from_file(cls) -> None:
@@ -520,6 +553,11 @@ class Ble:
             with self._lock:
                 return [info["random_id"] for info in self._registered_devices.values()]
 
+        def visible_student_ids(self) -> list:
+            """공개(visible)로 등록된 재실자 학번 목록. PUT /occupants 전송용."""
+            with self._lock:
+                return [sid for sid, info in self._registered_devices.items() if info["visible"]]
+
         def log_table(self) -> None:
             """재실 인원 테이블(학번 -> 세션토큰)이 바뀔 때마다 전체 스냅샷을 남긴다."""
             with self._lock:
@@ -527,15 +565,16 @@ class Ble:
             logger.info("ble roster table=%s", table)
 
     class Advertising:
-        """광고 인스턴스 3개(트리거·명단·확인). Ble.Payload만 참조하고 Registry/Adapter는 모른다."""
+        """광고 인스턴스 2개. Ble.Payload만 참조하고 Registry/Adapter는 모른다."""
 
         def __init__(self):
-            self.trigger_ad = None   # 0312, 기동 시 등록 후 상시 유지
-            self.roster_ad = None    # 3333, 기동 시 등록 후 상시 유지. 등록 목록이 바뀔 때 payload만 갱신
-            self.confirm_ad = None   # 2222, 이것도 기동 시 등록 후 상시 유지. 평소엔 비활성값을 내보내다가
-                                      # 인증 성공 시에만 실제 내용 + Duration을 잠깐 키운다(런타임
-                                      # register/unregister는 하지 않는다 — show_confirm 참고)
+            # 슬롯 A. 평소엔 진입 신호(0312), 인증 성공 시 확인(2222)을 담당한다. 두 신호는
+            # 시간상 배타적이라 한 슬롯을 UUID만 바꿔가며 쓴다 — set_signal 주석 참고.
+            self.signal_ad = None
+            self.roster_ad = None    # 슬롯 B. 3333, 등록 목록이 바뀔 때 payload만 갱신
             self.ad_manager_methods = None  # org.bluez.LEAdvertisingManager1 인터페이스 (등록/해제 전용)
+            # 확인을 내보내는 동안에도 "확인이 끝나면 진입 신호를 켤지" 를 기억해둔다.
+            self._presence_enabled = True
 
         @staticmethod
         def _advertisement_class():
@@ -580,9 +619,10 @@ class Ble:
                     # "peripheral"(connectable)로 두면 identity(고정 공개 MAC) 주소를 쓰므로
                     # 이 명령 자체가 필요 없어진다. GATT 연결은 안 쓰므로 폰 쪽엔 영향 없다.
                     self._props = {"Type": "peripheral"}
-                    # 앱은 트리거만 setServiceUuid(= Service UUID 목록 AD)로 거르고 나머지는
-                    # setServiceData로 거른다. UUID 목록은 4바이트를 더 먹으므로 꼭 필요한
-                    # 인스턴스에만 싣는다(24바이트 명단에 넣으면 31바이트 한도를 넘는다).
+                    # 앱은 진입 신호만 setServiceUuid(= Service UUID 목록 AD)로 거르고 나머지는
+                    # setServiceData로 거른다. UUID 목록은 4바이트를 더 먹으므로 꼭 필요할 때만
+                    # 싣는다(24바이트 명단에 넣으면 31바이트 한도를 넘는다).
+                    self.service_uuids_visible = include_service_uuids
                     if include_service_uuids:
                         self._props["ServiceUUIDs"] = dbus.Array([self._uuid_str], signature="s")
                     self._props["ServiceData"] = dbus.Dictionary({}, signature="sv")
@@ -595,6 +635,20 @@ class Ble:
 
                 def set_payload(self, payload) -> bool:
                     """이 인스턴스의 ServiceData를 교체한다. 내용이 같으면 아무 것도 하지 않는다."""
+                    return self.set_signal(self.uuid16, payload, self.service_uuids_visible)
+
+                def set_signal(self, uuid16: int, payload, include_service_uuids: bool) -> bool:
+                    """이 인스턴스가 내보낼 신호를 UUID째로 교체한다. 셋 다 같으면 아무 것도 하지 않는다.
+
+                    ServiceData의 UUID는 데이터에 붙는 키일 뿐 인스턴스를 식별하는 값이 아니다.
+                    bluetoothd는 ServiceData 딕셔너리를 받으면 기존 항목을 UUID 구분 없이 전부
+                    비운 뒤 받은 내용으로 다시 만들기 때문에(advertising.c의 parse_service_data →
+                    bt_ad_clear_service_data), 다른 UUID 하나만 실어 보내면 이전 UUID는 사라진다.
+                    그래서 한 슬롯이 진입 신호와 확인 신호를 번갈아 담당할 수 있다.
+
+                    앱은 진입 신호를 Service UUID 목록으로, 확인 신호를 ServiceData로 거른다.
+                    UUID 목록을 함께 갱신하는 이유가 이것이다 — 확인을 내보내는 동안 목록이
+                    남아 있으면 폰이 진입 신호로 오인한다."""
                     payload = bytes(payload)
                     if len(payload) > Ble.MAX_SERVICE_DATA_BYTES:
                         logger.error(
@@ -602,16 +656,34 @@ class Ble:
                             self.label, len(payload), Ble.MAX_SERVICE_DATA_BYTES,
                         )
                         return False
+                    uuid_str = Ble.Payload.uuid16_to_str(uuid16)
                     with self._lock:
-                        if self._payload == payload:
+                        unchanged = (
+                            self.uuid16 == uuid16
+                            and self._payload == payload
+                            and self.service_uuids_visible == include_service_uuids
+                        )
+                        if unchanged:
                             return False
+                        self.uuid16 = uuid16
+                        self._uuid_str = uuid_str
                         self._payload = payload
+                        self.service_uuids_visible = include_service_uuids
                         self._props["ServiceData"] = dbus.Dictionary(
-                            {self._uuid_str: dbus.Array(payload, signature="y")}, signature="sv"
+                            {uuid_str: dbus.Array(payload, signature="y")}, signature="sv"
                         )
-                        changed = dbus.Dictionary(
-                            {"ServiceData": self._props["ServiceData"]}, signature="sv"
+                        changed = {"ServiceData": self._props["ServiceData"]}
+                        # UUID 목록은 켤 때만 속성으로 남기고, 끌 때는 빈 배열을 신호로 보내
+                        # bluetoothd가 목록을 비우게 한 뒤 우리 쪽 키도 지운다.
+                        service_uuids = dbus.Array(
+                            [uuid_str] if include_service_uuids else [], signature="s"
                         )
+                        changed["ServiceUUIDs"] = service_uuids
+                        if include_service_uuids:
+                            self._props["ServiceUUIDs"] = service_uuids
+                        else:
+                            self._props.pop("ServiceUUIDs", None)
+                        changed = dbus.Dictionary(changed, signature="sv")
                     self.PropertiesChanged(
                         Ble.LE_ADVERTISEMENT_IFACE, changed, dbus.Array([], signature="s")
                     )
@@ -635,37 +707,12 @@ class Ble:
                     return True
 
                 def set_service_uuids_visible(self, visible: bool) -> bool:
-                    """이 인스턴스의 Service UUID 목록 AD를 실었다 뺐다 한다.
-                    값이 이미 그 상태면 아무 것도 하지 않는다.
+                    """UUID와 payload는 그대로 두고 Service UUID 목록 AD만 실었다 뺐다 한다.
 
-                    앱은 트리거 광고를 Service UUID 목록으로 거르므로, 이 목록을 비우면
-                    광고 등록을 유지한 채로 폰의 스캔 필터에 안 걸리게 만들 수 있다.
-                    ServiceData만 비워서는 앱 필터가 그대로 통과하므로 소용이 없다.
-
-                    bluetoothd는 ServiceData와 마찬가지로 ServiceUUIDs 변경도 감시하다가
-                    같은 인스턴스 번호로 광고 데이터를 다시 밀어넣는다. 런타임
-                    register/unregister를 쓰지 않고도 송출을 껐다 켤 수 있는 이유다."""
-                    with self._lock:
-                        already = "ServiceUUIDs" in self._props
-                        if already == visible:
-                            return False
-                        if visible:
-                            self._props["ServiceUUIDs"] = dbus.Array(
-                                [self._uuid_str], signature="s"
-                            )
-                        else:
-                            self._props["ServiceUUIDs"] = dbus.Array([], signature="s")
-                        changed = dbus.Dictionary(
-                            {"ServiceUUIDs": self._props["ServiceUUIDs"]}, signature="sv"
-                        )
-                        if not visible:
-                            # 다음 호출에서 "빠져 있음"으로 판정되도록 키 자체를 지운다.
-                            # 신호에는 빈 배열을 실어 bluetoothd가 목록을 비우게 한다.
-                            del self._props["ServiceUUIDs"]
-                    self.PropertiesChanged(
-                        Ble.LE_ADVERTISEMENT_IFACE, changed, dbus.Array([], signature="s")
-                    )
-                    return True
+                    앱은 진입 신호를 Service UUID 목록으로 거르므로, 목록을 비우면 광고 등록을
+                    유지한 채로 폰의 스캔 필터에 안 걸리게 만들 수 있다. ServiceData만 비워서는
+                    앱 필터가 그대로 통과하므로 소용이 없다."""
+                    return self.set_signal(self.uuid16, self._payload or b"", visible)
 
                 @dbus.service.signal(dbus.PROPERTIES_IFACE, signature="sa{sv}as")
                 def PropertiesChanged(self, interface, changed, invalidated):
@@ -705,36 +752,24 @@ class Ble:
             return DoorLockAdvertisement
 
         def init(self, bus, ad_manager_methods) -> None:
-            """광고 인스턴스 3개를 만든다. D-Bus 왕복(등록)은 하지 않는다."""
+            """광고 인스턴스 2개를 만든다. D-Bus 왕복(등록)은 하지 않는다."""
             self.ad_manager_methods = ad_manager_methods
             advertisement_cls = self._advertisement_class()
 
-            # 상시광고: 항상 송출. 앱이 setServiceUuid로 거르므로 UUID 목록을 함께 싣는다.
-            # Duration을 길게 잡아 다른 인스턴스로 넘어가는 공백을 짧게 유지한다.
-            self.trigger_ad = advertisement_cls(
-                bus, Ble.AD_PATH_TRIGGER, Ble.UUID_PRESENCE, "trigger",
-                include_service_uuids=True, duration=Ble.TRIGGER_DURATION_SECONDS,
+            # 슬롯 A: 진입 신호로 시작한다. 앱이 setServiceUuid로 거르므로 UUID 목록을 함께
+            # 싣는다. Duration이 로테이션의 대부분을 차지해 폰이 이 신호를 놓치기 어렵다.
+            self.signal_ad = advertisement_cls(
+                bus, Ble.AD_PATH_SIGNAL, Ble.UUID_PRESENCE, "signal",
+                include_service_uuids=True, duration=Ble.SIGNAL_DURATION_SECONDS,
             )
-            self.trigger_ad.set_payload(Ble.PRESENCE_PAYLOAD)
+            self.signal_ad.set_payload(Ble.PRESENCE_PAYLOAD)
 
-            # 명단: 상시 송출. 24바이트라 UUID 목록까지 넣으면 31바이트 한도를 넘으므로 ServiceData만.
+            # 슬롯 B: 명단. 24바이트라 UUID 목록까지 넣으면 31바이트 한도를 넘으므로 ServiceData만.
             self.roster_ad = advertisement_cls(
                 bus, Ble.AD_PATH_ROSTER, Ble.UUID_HEARTBEAT_ACK, "roster",
                 duration=Ble.ROSTER_DURATION_SECONDS,
             )
             self.roster_ad.set_payload(Ble.Payload.roster_payload([]))
-
-            # 확인: 이것도 기동 시 상시 등록한다 — 인증 성공 시에만 register/unregister하면
-            # 런타임 등록/해제가 AlreadyExists 영구 교착을 만든다(register_persistent 주석
-            # 참고). 그래서 등록은 기동 시 한 번뿐이고, 평소엔 비활성값(전부 0)을
-            # 싣고, 인증 성공 시에만 잠깐 실제 값으로 갈아끼운다 — 인코딩 학번은 항상
-            # ASCII 16진수 문자('0'-'9','A'-'F')라 전부 0인 바이트는 어떤 실제 학번과도
-            # 절대 일치하지 않으므로, 이 값이 곧 "아무 신호도 없음"과 동등하다.
-            self.confirm_ad = advertisement_cls(
-                bus, Ble.AD_PATH_CONFIRM, Ble.UUID_CONFIRM, "confirm",
-                duration=Ble.CONFIRM_DURATION_SECONDS,
-            )
-            self.confirm_ad.set_payload(bytes(Ble.REGISTRATION_PAYLOAD_LENGTH))
 
         def _register_one(self, ad, on_error=None) -> None:
             """광고를 bluetoothd에 등록한다.
@@ -783,24 +818,23 @@ class Ble:
                 logger.debug("ble: unregister %s skipped (%s)", ad.label, error)
 
         def register_persistent(self) -> None:
-            """세 인스턴스(트리거·명단·확인)를 전부 등록한다. 프로세스당 한 번만 호출한다.
+            """두 인스턴스를 등록한다. 프로세스당 한 번만 호출한다.
 
-            확인 인스턴스도 여기서 함께 등록한다 — 인증 이벤트마다 register/unregister를
-            반복하면 AlreadyExists 영구 교착에 빠진다(RegisterAdvertisement가 NoReply로 끝나도
+            등록은 이때가 전부다 — 신호가 바뀔 때마다 register/unregister를 반복하면
+            AlreadyExists 영구 교착에 빠진다(RegisterAdvertisement가 NoReply로 끝나도
             bluetoothd 큐에는 클라이언트가 남아, 같은 (owner, path) 재시도가 전부 거부된다 —
-            _register_one 주석 참고). 세 인스턴스 모두 기동 시 한 번 등록해두고, 이후엔
-            내용만 갈아끼운다.
+            _register_one 주석 참고). 이후 송출 내용은 전부 속성 갱신으로만 바꾼다.
 
             등록 전에 같은 경로를 먼저 해제해둔다. BlueZ는 소유자(D-Bus 발신자 이름)가 다르면
-            남의 광고를 건드리지 못하게 막으므로(advertising.c:1727) 이전 프로세스가 남긴 것은
+            남의 광고를 건드리지 못하게 막으므로(advertising.c:1727) 다른 프로세스가 남긴 것은
             어차피 우리가 못 지우지만, 우리 프로세스 안에서 상태가 꼬였을 때를 대비한 방어다.
             """
-            for ad in (self.trigger_ad, self.roster_ad, self.confirm_ad):
+            for ad in (self.signal_ad, self.roster_ad):
                 self._unregister_one(ad)
                 self._register_one(ad)
 
         def unregister_all(self) -> None:
-            for ad in (self.confirm_ad, self.roster_ad, self.trigger_ad):
+            for ad in (self.roster_ad, self.signal_ad):
                 self._unregister_one(ad)
 
         def refresh_roster(self, tokens: list) -> None:
@@ -810,7 +844,7 @@ class Ble:
             self.roster_ad.set_payload(Ble.Payload.roster_payload(tokens))
 
         def set_presence_enabled(self, enabled: bool) -> None:
-            """트리거(PRESENCE) 광고가 폰에 잡히게 할지 말지를 정한다.
+            """진입 신호(PRESENCE)가 폰에 잡히게 할지 말지를 정한다.
 
             정원이 차면 끄고, 자리가 나면 다시 켠다. 폰이 애초에 진입 신호를 못 보게 해서
             들어올 수 없는 상태에서 등록 요청을 반복하는 걸 막는다.
@@ -820,29 +854,42 @@ class Ble:
 
             이미 등록을 마친 사람들에게는 영향이 없다 — 앱은 진입 감시 단계에서만 이 신호를
             보고, 등록 뒤에는 재실 명단 쪽만 본다."""
-            if self.trigger_ad is None:
+            if self.signal_ad is None:
                 return
-            if self.trigger_ad.set_service_uuids_visible(enabled):
+            self._presence_enabled = enabled
+            if self.signal_ad.uuid16 != Ble.UUID_PRESENCE:
+                # 확인을 내보내는 중이다. 확인이 끝날 때 이 값으로 복귀한다.
+                return
+            if self.signal_ad.set_service_uuids_visible(enabled):
                 logger.info("ble presence advertisement %s", "enabled" if enabled else "disabled (roster full)")
 
         def show_confirm(self, student_id: str, random_id: int) -> None:
-            """등록 확인(2222) 내용을 Ble.CONFIRM_CONTENT_SECONDS 동안만 실제 값으로 보여준다.
+            """슬롯 A를 Ble.CONFIRM_CONTENT_SECONDS 동안 확인 신호(2222)로 바꾼다.
 
-            확인 인스턴스는 기동 시부터 항상 등록돼 있다 — 여기서 하는 일은 register가 아니라
-            set_payload/set_duration 뿐이다. Duration도 이 동안만 CONFIRM_ACTIVE_DURATION_SECONDS로
-            키워서, 로테이션 순번이 왔을 때 확인 채널이 훨씬 오래(그리고 훨씬 확실하게) 잡히게 한다.
-            시간이 지나면 hide_confirm이 둘 다 평소 값으로 되돌린다."""
-            self.confirm_ad.set_payload(Ble.Payload.encode_student_id(student_id) + bytes([random_id]))
-            self.confirm_ad.set_duration(Ble.CONFIRM_ACTIVE_DURATION_SECONDS)
+            확인을 보내는 동안에는 그 사람의 인증이 이미 끝나 진입 신호를 내보낼 이유가 없다.
+            그래서 슬롯을 따로 두지 않고 UUID만 바꿔 같은 자리를 쓴다. 앱이 확인을 ServiceData로
+            거르므로 UUID 목록은 함께 뺀다 — 남겨두면 폰이 진입 신호로 오인한다.
+
+            시간이 지나면 hide_confirm이 진입 신호로 되돌린다."""
+            if self.signal_ad is None:
+                return
+            self.signal_ad.set_signal(
+                Ble.UUID_CONFIRM,
+                Ble.Payload.encode_student_id(student_id) + bytes([random_id]),
+                include_service_uuids=False,
+            )
             t = threading.Timer(Ble.CONFIRM_CONTENT_SECONDS, self.hide_confirm)
             t.daemon = True
             t.start()
 
         def hide_confirm(self) -> None:
-            """확인 내용과 Duration을 평소값(비활성 payload, 1초)으로 되돌린다."""
-            if self.confirm_ad is not None:
-                self.confirm_ad.set_payload(bytes(Ble.REGISTRATION_PAYLOAD_LENGTH))
-                self.confirm_ad.set_duration(Ble.CONFIRM_DURATION_SECONDS)
+            """슬롯 A를 진입 신호로 되돌린다. 정원이 찬 동안이었다면 꺼진 상태로 돌아간다."""
+            if self.signal_ad is None:
+                return
+            self.signal_ad.set_signal(
+                Ble.UUID_PRESENCE, Ble.PRESENCE_PAYLOAD,
+                include_service_uuids=self._presence_enabled,
+            )
 
     class Adapter:
         """BlueZ 연결·스캔·메인루프. Ble.Payload에는 의존하지만(등록 payload 추출),
@@ -1027,6 +1074,10 @@ class Ble:
         self.registry = Ble.Registry()
         self.advertising = Ble.Advertising()
         self.adapter = Ble.Adapter()
+        self._started_at = time.monotonic()
+
+    def _within_startup_grace(self) -> bool:
+        return time.monotonic() - self._started_at < Ble.STARTUP_GRACE_SECONDS
 
     def _on_register_signal(self, payload: bytes, rssi: int) -> None:
         """폰이 보낸 REGISTER 신호 1건을 파싱해 Registry에 위임한다.
@@ -1087,6 +1138,7 @@ class Ble:
             "/internal/door-lock/accesses",
             {"number": int(student_id), "roomNumber": ROOM_NUMBER},
             source="bluetooth",
+            open_relay=not self._within_startup_grace(),
         )
         if result.kind != "ok":
             return
@@ -1122,6 +1174,16 @@ class Ble:
         t.daemon = True
         t.start()
 
+    def _occupants_push_loop(self) -> None:
+        """공개 재실자 목록을 주기적으로 백엔드에 올린다. threading.Timer로 스스로 재예약한다."""
+        try:
+            _push_occupants(self.registry.visible_student_ids())
+        except Exception:
+            logger.exception("occupants push loop error")
+        t = threading.Timer(OCCUPANTS_PUSH_INTERVAL_SECONDS, self._occupants_push_loop)
+        t.daemon = True
+        t.start()
+
     def start(self) -> None:
         """BLE 전용 스레드 진입점. 어댑터를 연결하고 광고를 등록한 뒤 메인루프를 돌린다."""
         self.adapter.prepare()
@@ -1134,7 +1196,7 @@ class Ble:
         # 근접 스캔/만료 정리는 GLib.timeout_add 대신 threading.Timer 기반 자기재예약
         # 루프로 돌린다 — 이 환경에서 GLib.timeout_add는 최초 1회 이후 반복 실행되지
         # 않는 것으로 실기에서 확인됐다 (README 참고).
-        for loop_fn in (self._proximity_scan_loop, self._reap_loop):
+        for loop_fn in (self._proximity_scan_loop, self._reap_loop, self._occupants_push_loop):
             t = threading.Timer(0.5, loop_fn)
             t.daemon = True
             t.start()
