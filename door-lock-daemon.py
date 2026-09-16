@@ -19,9 +19,7 @@ GPIO_PIN = 18
 UNLOCK_DURATION = 0.1  # 초 (레거시 open.py 기준)
 PORT = 8080
 LOG_FILE = "/var/log/door-lock/daemon.log"
-SCHEDULE_CACHE_FILE = "/var/cache/door-lock/schedules.json"
-SCHEDULE_REFRESH_INTERVAL = 3600  # 1시간
-SCHEDULE_RETRY_INTERVAL = 600    # 실패 시 10분 후 재시도
+MEMBERS_CACHE_FILE = "/var/cache/door-lock/members.json"
 OCCUPANTS_PUSH_INTERVAL_SECONDS = 60  # 재실 공개 명단을 백엔드에 올리는 주기
 
 with open("/etc/door-lock/api-key") as f:
@@ -39,66 +37,6 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger = logging.getLogger("door-lock")
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
-
-_schedule_cache = []
-_schedule_lock = threading.Lock()
-
-
-def _parse_iso(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def _load_cache_from_file():
-    try:
-        with open(SCHEDULE_CACHE_FILE) as f:
-            data = json.load(f)
-        schedules = data.get("schedules", [])
-        fetched_at = data.get("fetchedAt", 0)
-        with _schedule_lock:
-            _schedule_cache[:] = schedules
-        logger.info("schedules loaded from file count=%d", len(schedules))
-        return fetched_at
-    except Exception:
-        return 0
-
-
-def _save_cache_to_file(schedules):
-    try:
-        os.makedirs(os.path.dirname(SCHEDULE_CACHE_FILE), exist_ok=True)
-        with open(SCHEDULE_CACHE_FILE, "w") as f:
-            json.dump({"schedules": schedules, "fetchedAt": datetime.now(timezone.utc).timestamp()}, f)
-    except Exception as e:
-        logger.error("schedule cache write error: %s", e)
-
-
-def _refresh_schedules():
-    now = datetime.now(timezone.utc)
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    success = False
-    try:
-        resp = requests.get(
-            f"{BACKEND_URL}/schedules",
-            params={"from": start_of_day.strftime("%Y-%m-%dT%H:%M:%S"), "limit": 50},
-            headers={"x-api-key": INTERNAL_API_KEY},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            schedules = resp.json().get("schedules", [])
-            with _schedule_lock:
-                _schedule_cache[:] = schedules
-            _save_cache_to_file(schedules)
-            logger.info("schedules refreshed count=%d", len(schedules))
-            success = True
-        else:
-            logger.warning("schedule refresh failed status=%d", resp.status_code)
-    except Exception as e:
-        logger.error("schedule refresh error: %s", e)
-
-    next_interval = SCHEDULE_REFRESH_INTERVAL if success else SCHEDULE_RETRY_INTERVAL
-    t = threading.Timer(next_interval, _refresh_schedules)
-    t.daemon = True
-    t.start()
-
 
 def cors(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -134,18 +72,22 @@ def request_backend_authorization(endpoint: str, payload: dict) -> BackendResult
     return BackendResult(kind, resp.status_code, body)
 
 
-def attempt_unlock(endpoint: str, payload: dict, source: str, open_relay: bool = True) -> BackendResult:
-    """백엔드 인증 후 성공하면 릴레이를 연다. HTTP 라우트와 블루투스 인증 로직이 공통으로 호출한다.
+def open_relay(source: str, name: str = "") -> None:
+    relay.on()
+    time.sleep(UNLOCK_DURATION)
+    relay.off()
+    logger.info("unlocked source=%s name=%s", source, name)
 
-    open_relay=False면 인증 시퀀스는 동일하게 진행하되 릴레이만 작동시키지 않는다 — 데몬
+
+def attempt_unlock(endpoint: str, payload: dict, source: str, open_relay_flag: bool = True) -> BackendResult:
+    """백엔드 인증 후 성공하면 릴레이를 연다. 블루투스 인증 로직이 호출한다.
+
+    open_relay_flag=False면 인증 시퀀스는 동일하게 진행하되 릴레이만 작동시키지 않는다 — 데몬
     기동 직후 유예 기간에 재실 상태만 복구하고 문은 열지 않을 때 쓴다."""
     result = request_backend_authorization(endpoint, payload)
     if result.kind == "ok":
-        if open_relay:
-            relay.on()
-            time.sleep(UNLOCK_DURATION)
-            relay.off()
-            logger.info("unlocked source=%s name=%s", source, result.body.get("name"))
+        if open_relay_flag:
+            open_relay(source, result.body.get("name", ""))
         else:
             logger.info("authorized (relay suppressed) source=%s name=%s", source, result.body.get("name"))
     else:
@@ -1138,7 +1080,7 @@ class Ble:
             "/internal/door-lock/accesses",
             {"number": int(student_id), "roomNumber": ROOM_NUMBER},
             source="bluetooth",
-            open_relay=not self._within_startup_grace(),
+            open_relay_flag=not self._within_startup_grace(),
         )
         if result.kind != "ok":
             return
@@ -1334,32 +1276,40 @@ def health():
     return cors(jsonify({"status": "ok"}))
 
 
-@app.route("/schedules/now", methods=["GET", "OPTIONS"])
-def schedule_now():
+@app.route("/room-env-var", methods=["GET", "OPTIONS"])
+def room_env_var():
     if request.method == "OPTIONS":
         return cors(make_response("", 204))
-    now = datetime.now(timezone.utc)
-    with _schedule_lock:
-        current = next(
-            (s for s in _schedule_cache
-             if _parse_iso(s["scheduledAt"]) <= now
-             and (s["endAt"] is None or _parse_iso(s["endAt"]) >= now)),
-            None,
-        )
-    return cors(jsonify(current))
+    if request.remote_addr != "127.0.0.1":
+        return cors(jsonify({"message": "forbidden"})), 403
+    return cors(jsonify({"roomNumber": ROOM_NUMBER, "apiKey": INTERNAL_API_KEY}))
 
 
-@app.route("/schedules/next", methods=["GET", "OPTIONS"])
-def schedule_next():
+@app.route("/members", methods=["GET", "POST", "OPTIONS"])
+def members():
     if request.method == "OPTIONS":
         return cors(make_response("", 204))
-    now = datetime.now(timezone.utc)
-    with _schedule_lock:
-        nxt = next(
-            (s for s in _schedule_cache if _parse_iso(s["scheduledAt"]) > now),
-            None,
-        )
-    return cors(jsonify(nxt))
+    if request.remote_addr != "127.0.0.1":
+        return cors(jsonify({"message": "forbidden"})), 403
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        members_list = data.get("members", [])
+        try:
+            os.makedirs(os.path.dirname(MEMBERS_CACHE_FILE), exist_ok=True)
+            with open(MEMBERS_CACHE_FILE, "w") as f:
+                json.dump({"members": members_list}, f)
+        except Exception as e:
+            logger.error("members cache write error: %s", e)
+            return cors(jsonify({"message": "write failed"})), 500
+        return cors(jsonify({"message": "ok"}))
+
+    try:
+        with open(MEMBERS_CACHE_FILE) as f:
+            data = json.load(f)
+        return cors(jsonify({"members": data.get("members", [])}))
+    except Exception:
+        return cors(jsonify({"members": []}))
 
 
 @app.route("/unlock", methods=["POST", "OPTIONS"])
@@ -1375,21 +1325,9 @@ def unlock():
     if student_id is None:
         return cors(jsonify({"message": "studentId required"})), 400
 
-    logger.info("unlock attempt student_id=%s", student_id)
-    result = attempt_unlock(
-        "/internal/door-lock/accesses",
-        {"number": int(student_id), "roomNumber": ROOM_NUMBER},
-        source="keypad",
-    )
-
-    if result.kind == "timeout":
-        return cors(jsonify({"message": "timeout"})), 504
-    if result.kind == "network_error":
-        return cors(jsonify({"message": "network"})), 502
-    if result.kind == "denied":
-        return cors(jsonify({"message": "unauthorized"})), 403
-
-    return cors(jsonify({"message": "ok", "name": result.body.get("name") or ""}))
+    logger.info("unlock (relay-only) student_id=%s", student_id)
+    open_relay("keypad")
+    return cors(jsonify({"message": "ok"}))
 
 
 def _shutdown_ble(*_args) -> None:
@@ -1406,14 +1344,5 @@ signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
 
 if __name__ == "__main__":
-    fetched_at = _load_cache_from_file()
-    elapsed = datetime.now(timezone.utc).timestamp() - fetched_at
-    if elapsed >= SCHEDULE_REFRESH_INTERVAL:
-        _refresh_schedules()
-    else:
-        t = threading.Timer(SCHEDULE_REFRESH_INTERVAL - elapsed, _refresh_schedules)
-        t.daemon = True
-        t.start()
-        logger.info("schedules cache valid, next refresh in %.0fs", SCHEDULE_REFRESH_INTERVAL - elapsed)
     start_reader()
     app.run(host="127.0.0.1", port=PORT, threaded=True)
