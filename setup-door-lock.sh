@@ -129,25 +129,35 @@ KEY_SRC="${SETUP_DIR}/internal-api-key"
 API_KEY_DIR="/etc/door-lock"
 API_KEY_FILE="${API_KEY_DIR}/api-key"
 
-if [ -f "$KEY_SRC" ]; then
+sudo mkdir -p "$API_KEY_DIR"
+sudo chown root:"$DAEMON_SVC_USER" "$API_KEY_DIR"
+sudo chmod 750 "$API_KEY_DIR"
+
+# 이미 기기에 배포된 키가 있으면 그 값을 최우선으로 쓰고 절대 덮어쓰지 않는다 — 백엔드의
+# INTERNAL_API_KEY는 이 파일 값과 수동으로 맞춰져 있어서, 재실행 시 새 키로 바뀌면 그 순간
+# 인증이 전부 끊긴다.
+if sudo test -s "$API_KEY_FILE"; then
+    API_KEY=$(sudo cat "$API_KEY_FILE")
+    echo "  API key already deployed, keeping existing value: ${API_KEY_FILE}"
+elif [ -f "$KEY_SRC" ]; then
     API_KEY=$(cat "$KEY_SRC")
     echo "  Read from internal-api-key file"
+    echo "$API_KEY" | sudo tee "$API_KEY_FILE" > /dev/null
+    sudo chown root:"$DAEMON_SVC_USER" "$API_KEY_FILE"
+    sudo chmod 640 "$API_KEY_FILE"
+    echo "  API key saved: ${API_KEY_FILE}"
 else
     API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
     echo "$API_KEY" > "$KEY_SRC"
     echo "  API key generated and saved: ${KEY_SRC}"
+    echo "$API_KEY" | sudo tee "$API_KEY_FILE" > /dev/null
+    sudo chown root:"$DAEMON_SVC_USER" "$API_KEY_FILE"
+    sudo chmod 640 "$API_KEY_FILE"
+    echo "  API key saved: ${API_KEY_FILE}"
 fi
-
-sudo mkdir -p "$API_KEY_DIR"
-sudo chown root:"$DAEMON_SVC_USER" "$API_KEY_DIR"
-sudo chmod 750 "$API_KEY_DIR"
-echo "$API_KEY" | sudo tee "$API_KEY_FILE" > /dev/null
-sudo chown root:"$DAEMON_SVC_USER" "$API_KEY_FILE"
-sudo chmod 640 "$API_KEY_FILE"
-echo "  API key saved: ${API_KEY_FILE}"
 echo ""
 echo "  !! Set the backend INTERNAL_API_KEY env var to:"
-echo "     $(cat "$KEY_SRC")"
+echo "     $API_KEY"
 echo ""
 
 # ── 5. BLE UUID config ────────────────────────────────────────────────────────
